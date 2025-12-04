@@ -1,8 +1,20 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import Constants from 'expo-constants';
 
-// Get Supabase URL and Anon Key from environment variables
-// You'll need to add these to your .env file or expo-constants
+/**
+ * Supabase Client Configuration
+ * 
+ * IMPORTANT SECURITY NOTES:
+ * - Use the ANON KEY (public key) for client-side applications
+ * - NEVER use the SERVICE ROLE KEY in client-side code - it bypasses all security!
+ * - The anon key respects Row Level Security (RLS) policies
+ * - For admin access, configure RLS policies in Supabase to allow admin users
+ * 
+ * Get your credentials from: Supabase Dashboard > Settings > API
+ * - Project URL: Use this as EXPO_PUBLIC_SUPABASE_URL
+ * - anon public key: Use this as EXPO_PUBLIC_SUPABASE_ANON_KEY (NOT the service_role key!)
+ */
+
 const supabaseUrl = Constants.expoConfig?.extra?.supabaseUrl || process.env.EXPO_PUBLIC_SUPABASE_URL || '';
 const supabaseAnonKey = Constants.expoConfig?.extra?.supabaseAnonKey || process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || '';
 

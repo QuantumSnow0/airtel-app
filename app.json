@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "airtel-Router",
+    "name": "Airtel Router",
     "slug": "airtel-Router",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -12,8 +12,15 @@
       "supportsTablet": true
     },
     "android": {
+      "package": "com.airtel.router",
+      "versionCode": 1,
+      "permissions": ["CALL_PHONE", "INTERNET"],
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/icon.png",
+        "backgroundColor": "#0A0A0A"
+      }
     },
     "web": {
       "output": "static",
@@ -37,6 +44,12 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "7603a739-48d3-4620-adfb-52b131c727bf"
+      }
     }
   }
 }
