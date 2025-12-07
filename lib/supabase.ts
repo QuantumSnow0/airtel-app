@@ -23,7 +23,15 @@ export const isSupabaseConfigured = !!(supabaseUrl && supabaseAnonKey);
 let supabase: SupabaseClient | null = null;
 
 if (isSupabaseConfigured) {
-  supabase = createClient(supabaseUrl, supabaseAnonKey);
+  supabase = createClient(supabaseUrl, supabaseAnonKey, {
+    auth: {
+      persistSession: false,
+    },
+  });
+  console.log('Supabase client initialized:', {
+    url: supabaseUrl ? `${supabaseUrl.substring(0, 20)}...` : 'missing',
+    hasKey: !!supabaseAnonKey,
+  });
 } else {
   console.warn('Supabase URL and Anon Key are required. Please set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY in your .env file or app.json');
 }

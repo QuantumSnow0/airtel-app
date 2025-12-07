@@ -18,6 +18,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { getSupabaseClient, isSupabaseConfigured } from "../../lib/supabase";
 import { Calendar } from "react-native-calendars";
+import { sendWhatsAppMessage } from "../../lib/whatsapp";
 
 const FILTER_STORAGE_KEY = "@airtel_customer_town_filter";
 const VISIT_DATE_FILTER_KEY = "@airtel_customer_visit_date_filter";
@@ -56,6 +57,8 @@ export default function CustomersScreen() {
   const [availableVisitDates, setAvailableVisitDates] = useState<string[]>([]);
   const [showVisitDateModal, setShowVisitDateModal] = useState(false);
   const [markedDates, setMarkedDates] = useState<{ [key: string]: any }>({});
+  const [sendingWhatsApp, setSendingWhatsApp] = useState(false);
+  const [whatsAppMessage, setWhatsAppMessage] = useState<string | null>(null);
 
   useEffect(() => {
     if (isSupabaseConfigured) {
@@ -530,6 +533,38 @@ export default function CustomersScreen() {
     });
   };
 
+  // Test WhatsApp message
+  const handleTestWhatsApp = async () => {
+    setSendingWhatsApp(true);
+    setWhatsAppMessage(null);
+
+    try {
+      const result = await sendWhatsAppMessage({
+        to: "+254724832555",
+        contentSid: "HXb5b62575e6e4ff6129ad7c8efe1f983e",
+        contentVariables: {
+          "1": "12/1",
+          "2": "3pm"
+        }
+      });
+
+      if (result.success) {
+        setWhatsAppMessage("✅ WhatsApp sent successfully!");
+        // Clear message after 3 seconds
+        setTimeout(() => setWhatsAppMessage(null), 3000);
+      } else {
+        setWhatsAppMessage(`❌ Error: ${result.error || "Failed to send"}`);
+        // Clear message after 5 seconds
+        setTimeout(() => setWhatsAppMessage(null), 5000);
+      }
+    } catch (error) {
+      setWhatsAppMessage(`❌ Error: ${error instanceof Error ? error.message : "Unknown error"}`);
+      setTimeout(() => setWhatsAppMessage(null), 5000);
+    } finally {
+      setSendingWhatsApp(false);
+    }
+  };
+
   return (
     <SafeAreaView style={styles.container}>
       {/* Header Section */}
@@ -566,6 +601,28 @@ export default function CustomersScreen() {
           )}
           <Text style={styles.labelText}>standard customers</Text>
         </View>
+      </View>
+
+      {/* Test WhatsApp Button */}
+      <View style={styles.testWhatsAppContainer}>
+        <TouchableOpacity
+          style={[styles.testWhatsAppButton, sendingWhatsApp && styles.testWhatsAppButtonDisabled]}
+          onPress={handleTestWhatsApp}
+          disabled={sendingWhatsApp}
+        >
+          <Ionicons
+            name="logo-whatsapp"
+            size={20}
+            color="#FFFFFF"
+            style={styles.testWhatsAppIcon}
+          />
+          <Text style={styles.testWhatsAppText}>
+            {sendingWhatsApp ? "Sending..." : "Test WhatsApp Message"}
+          </Text>
+        </TouchableOpacity>
+        {whatsAppMessage && (
+          <Text style={styles.whatsAppMessageText}>{whatsAppMessage}</Text>
+        )}
       </View>
 
       {/* Search Bar */}
@@ -1265,5 +1322,38 @@ const styles = StyleSheet.create({
   calendarContainer: {
     padding: 20,
     paddingTop: 0,
+  },
+  testWhatsAppContainer: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    alignItems: "center",
+  },
+  testWhatsAppButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#25D366",
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    borderRadius: 12,
+    minWidth: 200,
+    justifyContent: "center",
+  },
+  testWhatsAppButtonDisabled: {
+    opacity: 0.6,
+  },
+  testWhatsAppIcon: {
+    marginRight: 8,
+  },
+  testWhatsAppText: {
+    fontSize: 14,
+    fontFamily: "Inter_600SemiBold",
+    color: "#FFFFFF",
+  },
+  whatsAppMessageText: {
+    marginTop: 8,
+    fontSize: 12,
+    fontFamily: "Inter_400Regular",
+    color: "#9CA3AF",
+    textAlign: "center",
   },
 });

@@ -95,7 +95,13 @@ export default function HomeScreen() {
         .select("*", { count: "exact", head: true });
 
       if (totalError) {
-        console.error("Error fetching total count:", totalError);
+        console.error("Error fetching total count:", {
+          error: totalError,
+          message: totalError.message,
+          details: totalError.details,
+          hint: totalError.hint,
+          code: totalError.code,
+        });
         setTotalCount(0);
       } else {
         setTotalCount(total || 0);
@@ -116,7 +122,13 @@ export default function HomeScreen() {
         .lt("created_at", tomorrowStart);
 
       if (todayError) {
-        console.error("Error fetching today's count:", todayError);
+        console.error("Error fetching today's count:", {
+          error: todayError,
+          message: todayError.message,
+          details: todayError.details,
+          hint: todayError.hint,
+          code: todayError.code,
+        });
         setTodayCount(0);
       } else {
         setTodayCount(todayCount || 0);
@@ -134,7 +146,13 @@ export default function HomeScreen() {
         .lt("created_at", todayStart);
 
       if (yesterdayError) {
-        console.error("Error fetching yesterday's count:", yesterdayError);
+        console.error("Error fetching yesterday's count:", {
+          error: yesterdayError,
+          message: yesterdayError.message,
+          details: yesterdayError.details,
+          hint: yesterdayError.hint,
+          code: yesterdayError.code,
+        });
         setYesterdayCount(0);
       } else {
         setYesterdayCount(yesterdayCount || 0);
@@ -149,13 +167,23 @@ export default function HomeScreen() {
         .order("created_at", { ascending: false });
 
       if (leadsError) {
-        console.error("Error fetching leads:", leadsError);
+        console.error("Error fetching leads:", {
+          error: leadsError,
+          message: leadsError.message,
+          details: leadsError.details,
+          hint: leadsError.hint,
+          code: leadsError.code,
+        });
         setLeads([]);
       } else {
         setLeads(leadsData || []);
       }
     } catch (error) {
-      console.error("Error:", error);
+      console.error("Unexpected error in fetchCounts:", {
+        error,
+        message: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
       setTotalCount(0);
       setTodayCount(0);
       setLeads([]);
