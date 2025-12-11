@@ -46,6 +46,7 @@ export default function RootLayout() {
       <StatusBar style="light" hidden={true} />
       <Stack screenOptions={{ headerShown: false }}>
         <Stack.Screen name="index" />
+        <Stack.Screen name="auth" />
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
       </Stack>
     </>

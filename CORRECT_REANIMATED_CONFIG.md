@@ -41,3 +41,5 @@ To use New Architecture, you would need to:
 
 **Reference**: [Reanimated Getting Started](https://docs.swmansion.com/react-native-reanimated/docs/fundamentals/getting-started/)
 
+
+

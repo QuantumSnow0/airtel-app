@@ -1,12 +1,9 @@
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Ionicons } from "@expo/vector-icons";
-import React, { useEffect, useState, useRef } from "react";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import React, { useEffect, useState } from "react";
 import {
-  Animated,
-  Dimensions,
   Linking,
   Modal,
-  PanResponder,
   RefreshControl,
   ScrollView,
   StyleSheet,
@@ -15,10 +12,9 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { Calendar } from "react-native-calendars";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { getSupabaseClient, isSupabaseConfigured } from "../../lib/supabase";
-import { Calendar } from "react-native-calendars";
-import { sendWhatsAppMessage } from "../../lib/whatsapp";
 
 const FILTER_STORAGE_KEY = "@airtel_customer_town_filter";
 const VISIT_DATE_FILTER_KEY = "@airtel_customer_visit_date_filter";
@@ -52,13 +48,15 @@ export default function CustomersScreen() {
   const [selectedTown, setSelectedTown] = useState<string | null>(null);
   const [availableTowns, setAvailableTowns] = useState<string[]>([]);
   const [showFilterModal, setShowFilterModal] = useState(false);
-  const [expandedCustomerId, setExpandedCustomerId] = useState<string | null>(null);
-  const [selectedVisitDate, setSelectedVisitDate] = useState<string | null>(null);
+  const [expandedCustomerId, setExpandedCustomerId] = useState<string | null>(
+    null
+  );
+  const [selectedVisitDate, setSelectedVisitDate] = useState<string | null>(
+    null
+  );
   const [availableVisitDates, setAvailableVisitDates] = useState<string[]>([]);
   const [showVisitDateModal, setShowVisitDateModal] = useState(false);
   const [markedDates, setMarkedDates] = useState<{ [key: string]: any }>({});
-  const [sendingWhatsApp, setSendingWhatsApp] = useState(false);
-  const [whatsAppMessage, setWhatsAppMessage] = useState<string | null>(null);
 
   useEffect(() => {
     if (isSupabaseConfigured) {
@@ -114,7 +112,7 @@ export default function CustomersScreen() {
         dotColor: "#FFD700",
       };
     });
-    
+
     if (selectedVisitDate && marked[selectedVisitDate]) {
       marked[selectedVisitDate] = {
         ...marked[selectedVisitDate],
@@ -123,7 +121,7 @@ export default function CustomersScreen() {
         selectedTextColor: "#000000",
       };
     }
-    
+
     setMarkedDates(marked);
   }, [availableVisitDates, selectedVisitDate]);
 
@@ -306,9 +304,26 @@ export default function CustomersScreen() {
 
       // Apply search filter if there's a query
       if (searchQuery.trim()) {
-        query = query.or(
-          `customer_name.ilike.%${searchQuery}%,installation_town.ilike.%${searchQuery}%`
-        );
+        const phonePatterns = getPhoneSearchPatterns(searchQuery);
+
+        // Build search conditions
+        let searchConditions = `customer_name.ilike.%${searchQuery}%,installation_town.ilike.%${searchQuery}%`;
+
+        // Add phone number search patterns
+        if (phonePatterns.length > 0) {
+          const airtelConditions = phonePatterns
+            .map((p) => `airtel_number.ilike.%${p}%`)
+            .join(",");
+          const alternateConditions = phonePatterns
+            .map((p) => `alternate_number.ilike.%${p}%`)
+            .join(",");
+          searchConditions += `,${airtelConditions},${alternateConditions}`;
+        } else {
+          // Fallback: search as-is if no phone patterns
+          searchConditions += `,airtel_number.ilike.%${searchQuery}%,alternate_number.ilike.%${searchQuery}%`;
+        }
+
+        query = query.or(searchConditions);
       }
 
       const { data, error } = await query;
@@ -427,45 +442,53 @@ export default function CustomersScreen() {
 
   // Organize dates: past below, future above, current in center
   // This uses a consistent chronological ordering to prevent date switching
-  const organizeDatesForPicker = (dates: string[], selectedDate: string | null) => {
+  const organizeDatesForPicker = (
+    dates: string[],
+    selectedDate: string | null
+  ) => {
     if (dates.length === 0) return [];
-    
+
     const today = new Date();
     today.setHours(0, 0, 0, 0);
-    
+
     // Sort all dates chronologically
     const sortedDates = [...dates].sort((a, b) => {
       return new Date(a).getTime() - new Date(b).getTime();
     });
-    
+
     // Find today's index in the sorted array
     const todayIndex = sortedDates.findIndex((date) => {
       const dateObj = new Date(date);
       dateObj.setHours(0, 0, 0, 0);
       return dateObj.getTime() === today.getTime();
     });
-    
+
     // If we have a selected date, find its index
     let selectedIndex = -1;
     if (selectedDate) {
       selectedIndex = sortedDates.indexOf(selectedDate);
     }
-    
+
     // Use selected date as center if available, otherwise use today
-    const centerIndex = selectedIndex >= 0 ? selectedIndex : (todayIndex >= 0 ? todayIndex : Math.floor(sortedDates.length / 2));
-    
+    const centerIndex =
+      selectedIndex >= 0
+        ? selectedIndex
+        : todayIndex >= 0
+          ? todayIndex
+          : Math.floor(sortedDates.length / 2);
+
     // Split into past and future relative to center
     const centerDate = sortedDates[centerIndex];
     const pastDates: string[] = [];
     const futureDates: string[] = [];
     const centerDates: string[] = [];
-    
+
     sortedDates.forEach((date) => {
       const dateObj = new Date(date);
       dateObj.setHours(0, 0, 0, 0);
       const centerDateObj = new Date(centerDate);
       centerDateObj.setHours(0, 0, 0, 0);
-      
+
       if (dateObj.getTime() < centerDateObj.getTime()) {
         pastDates.push(date);
       } else if (dateObj.getTime() > centerDateObj.getTime()) {
@@ -474,7 +497,7 @@ export default function CustomersScreen() {
         centerDates.push(date);
       }
     });
-    
+
     // Return: past (descending) -> center -> future (ascending)
     return [...pastDates.reverse(), ...centerDates, ...futureDates];
   };
@@ -507,6 +530,45 @@ export default function CustomersScreen() {
     return cleaned;
   };
 
+  // Generate phone number search patterns for different formats
+  const getPhoneSearchPatterns = (searchQuery: string): string[] => {
+    // Remove any non-digit characters
+    const digits = searchQuery.replace(/\D/g, "");
+    if (digits.length === 0) return [];
+
+    const patterns: string[] = [];
+
+    // If it starts with 0, try both 0 and 254 formats
+    if (digits.startsWith("0")) {
+      // Original: 07248...
+      patterns.push(digits);
+      // With 254: 2547248...
+      patterns.push("254" + digits.substring(1));
+      // Without leading 0: 7248...
+      patterns.push(digits.substring(1));
+    }
+    // If it starts with 254, try both 254 and 0 formats
+    else if (digits.startsWith("254")) {
+      // Original: 2547248...
+      patterns.push(digits);
+      // With 0: 07248...
+      patterns.push("0" + digits.substring(3));
+      // Without 254: 7248...
+      patterns.push(digits.substring(3));
+    }
+    // If it's just digits (no prefix), try all formats
+    else {
+      // As-is: 7248...
+      patterns.push(digits);
+      // With 0: 07248...
+      patterns.push("0" + digits);
+      // With 254: 2547248...
+      patterns.push("254" + digits);
+    }
+
+    return [...new Set(patterns)]; // Remove duplicates
+  };
+
   // Get full phone number with +254 prefix for calling
   const getFullPhoneNumber = (phone: string) => {
     if (!phone) return phone;
@@ -531,38 +593,6 @@ export default function CustomersScreen() {
     Linking.openURL(phoneUrl).catch((err) => {
       console.error("Error calling:", err);
     });
-  };
-
-  // Test WhatsApp message
-  const handleTestWhatsApp = async () => {
-    setSendingWhatsApp(true);
-    setWhatsAppMessage(null);
-
-    try {
-      const result = await sendWhatsAppMessage({
-        to: "+254724832555",
-        contentSid: "HXb5b62575e6e4ff6129ad7c8efe1f983e",
-        contentVariables: {
-          "1": "12/1",
-          "2": "3pm"
-        }
-      });
-
-      if (result.success) {
-        setWhatsAppMessage("✅ WhatsApp sent successfully!");
-        // Clear message after 3 seconds
-        setTimeout(() => setWhatsAppMessage(null), 3000);
-      } else {
-        setWhatsAppMessage(`❌ Error: ${result.error || "Failed to send"}`);
-        // Clear message after 5 seconds
-        setTimeout(() => setWhatsAppMessage(null), 5000);
-      }
-    } catch (error) {
-      setWhatsAppMessage(`❌ Error: ${error instanceof Error ? error.message : "Unknown error"}`);
-      setTimeout(() => setWhatsAppMessage(null), 5000);
-    } finally {
-      setSendingWhatsApp(false);
-    }
   };
 
   return (
@@ -601,28 +631,6 @@ export default function CustomersScreen() {
           )}
           <Text style={styles.labelText}>standard customers</Text>
         </View>
-      </View>
-
-      {/* Test WhatsApp Button */}
-      <View style={styles.testWhatsAppContainer}>
-        <TouchableOpacity
-          style={[styles.testWhatsAppButton, sendingWhatsApp && styles.testWhatsAppButtonDisabled]}
-          onPress={handleTestWhatsApp}
-          disabled={sendingWhatsApp}
-        >
-          <Ionicons
-            name="logo-whatsapp"
-            size={20}
-            color="#FFFFFF"
-            style={styles.testWhatsAppIcon}
-          />
-          <Text style={styles.testWhatsAppText}>
-            {sendingWhatsApp ? "Sending..." : "Test WhatsApp Message"}
-          </Text>
-        </TouchableOpacity>
-        {whatsAppMessage && (
-          <Text style={styles.whatsAppMessageText}>{whatsAppMessage}</Text>
-        )}
       </View>
 
       {/* Search Bar */}
@@ -667,10 +675,7 @@ export default function CustomersScreen() {
             color={selectedTown ? "#FFD700" : "#9CA3AF"}
           />
           <Text
-            style={[
-              styles.filterText,
-              selectedTown && styles.filterTextActive,
-            ]}
+            style={[styles.filterText, selectedTown && styles.filterTextActive]}
           >
             {selectedTown || "All Towns"}
           </Text>
@@ -684,27 +689,27 @@ export default function CustomersScreen() {
             <Ionicons name="close-circle" size={20} color="#9CA3AF" />
           </TouchableOpacity>
         )}
-            <TouchableOpacity
-              style={styles.filterButton}
-              onPress={() => setShowVisitDateModal(true)}
-            >
-              <Ionicons
-                name="calendar"
-                size={18}
-                color={selectedVisitDate ? "#FFD700" : "#9CA3AF"}
-              />
-              <Text
-                style={[
-                  styles.filterText,
-                  selectedVisitDate && styles.filterTextActive,
-                ]}
-              >
-                {selectedVisitDate
-                  ? formatDateForPicker(selectedVisitDate)
-                  : "All Visit Dates"}
-              </Text>
-              <Ionicons name="chevron-down" size={18} color="#9CA3AF" />
-            </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.filterButton}
+          onPress={() => setShowVisitDateModal(true)}
+        >
+          <Ionicons
+            name="calendar"
+            size={18}
+            color={selectedVisitDate ? "#FFD700" : "#9CA3AF"}
+          />
+          <Text
+            style={[
+              styles.filterText,
+              selectedVisitDate && styles.filterTextActive,
+            ]}
+          >
+            {selectedVisitDate
+              ? formatDateForPicker(selectedVisitDate)
+              : "All Visit Dates"}
+          </Text>
+          <Ionicons name="chevron-down" size={18} color="#9CA3AF" />
+        </TouchableOpacity>
         {selectedVisitDate && (
           <TouchableOpacity
             style={styles.clearFilterButton}
@@ -734,131 +739,135 @@ export default function CustomersScreen() {
             />
           }
         >
-        {loading && customers.length === 0 ? (
-          <View style={styles.emptyState}>
-            <Text style={styles.emptyText}>Loading...</Text>
-          </View>
-        ) : customers.length === 0 ? (
-          <View style={styles.emptyState}>
-            <Text style={styles.emptyText}>No customers found</Text>
-          </View>
-        ) : (
-          customers.map((customer) => {
-            const isExpanded = expandedCustomerId === customer.id;
-            return (
-              <View key={customer.id}>
-                <TouchableOpacity
-                  style={styles.customerRow}
-                  onPress={() =>
-                    setExpandedCustomerId(isExpanded ? null : customer.id)
-                  }
-                  activeOpacity={0.7}
-                >
-                  <Text style={styles.customerName} numberOfLines={1}>
-                    {formatName(customer.customer_name)}
-                  </Text>
-                  <View style={styles.customerRowRight}>
-                    <Text style={styles.customerTown} numberOfLines={1}>
-                      {customer.installation_town}
+          {loading && customers.length === 0 ? (
+            <View style={styles.emptyState}>
+              <Text style={styles.emptyText}>Loading...</Text>
+            </View>
+          ) : customers.length === 0 ? (
+            <View style={styles.emptyState}>
+              <Text style={styles.emptyText}>No customers found</Text>
+            </View>
+          ) : (
+            customers.map((customer) => {
+              const isExpanded = expandedCustomerId === customer.id;
+              return (
+                <View key={customer.id}>
+                  <TouchableOpacity
+                    style={styles.customerRow}
+                    onPress={() =>
+                      setExpandedCustomerId(isExpanded ? null : customer.id)
+                    }
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.customerName} numberOfLines={1}>
+                      {formatName(customer.customer_name)}
                     </Text>
-                    <Ionicons
-                      name={isExpanded ? "chevron-up" : "chevron-down"}
-                      size={20}
-                      color="#9CA3AF"
-                      style={styles.expandIcon}
-                    />
-                  </View>
-                </TouchableOpacity>
-                {isExpanded && (
-                  <View style={styles.customerDetails}>
-                    <View style={styles.detailRow}>
-                      <Text style={styles.detailLabel}>Email</Text>
-                      <Text style={styles.detailValue}>
-                        {customer.email || "N/A"}
+                    <View style={styles.customerRowRight}>
+                      <Text style={styles.customerTown} numberOfLines={1}>
+                        {customer.installation_town}
                       </Text>
+                      <Ionicons
+                        name={isExpanded ? "chevron-up" : "chevron-down"}
+                        size={20}
+                        color="#9CA3AF"
+                        style={styles.expandIcon}
+                      />
                     </View>
-                    <View style={styles.detailRow}>
-                      <Text style={styles.detailLabel}>Package</Text>
-                      <Text style={styles.detailValue}>
-                        {customer.preferred_package || "N/A"}
-                      </Text>
-                    </View>
-                    <TouchableOpacity
-                      style={styles.detailRow}
-                      onPress={() =>
-                        customer.airtel_number &&
-                        handleCallNumber(customer.airtel_number)
-                      }
-                      disabled={!customer.airtel_number}
-                      activeOpacity={customer.airtel_number ? 0.7 : 1}
-                    >
-                      <Text style={styles.detailLabel}>Airtel</Text>
-                      <Text
-                        style={[
-                          styles.detailValue,
-                          customer.airtel_number && styles.detailValueClickable,
-                        ]}
+                  </TouchableOpacity>
+                  {isExpanded && (
+                    <View style={styles.customerDetails}>
+                      <View style={styles.detailRow}>
+                        <Text style={styles.detailLabel}>Email</Text>
+                        <Text style={styles.detailValue}>
+                          {customer.email || "N/A"}
+                        </Text>
+                      </View>
+                      <View style={styles.detailRow}>
+                        <Text style={styles.detailLabel}>Package</Text>
+                        <Text style={styles.detailValue}>
+                          {customer.preferred_package || "N/A"}
+                        </Text>
+                      </View>
+                      <TouchableOpacity
+                        style={styles.detailRow}
+                        onPress={() =>
+                          customer.airtel_number &&
+                          handleCallNumber(customer.airtel_number)
+                        }
+                        disabled={!customer.airtel_number}
+                        activeOpacity={customer.airtel_number ? 0.7 : 1}
                       >
-                        {customer.airtel_number
-                          ? formatPhoneNumber(customer.airtel_number)
-                          : "N/A"}
-                      </Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      style={styles.detailRow}
-                      onPress={() =>
-                        customer.alternate_number &&
-                        handleCallNumber(customer.alternate_number)
-                      }
-                      disabled={!customer.alternate_number}
-                      activeOpacity={customer.alternate_number ? 0.7 : 1}
-                    >
-                      <Text style={styles.detailLabel}>Alternate</Text>
-                      <Text
-                        style={[
-                          styles.detailValue,
-                          customer.alternate_number && styles.detailValueClickable,
-                        ]}
+                        <Text style={styles.detailLabel}>Airtel</Text>
+                        <Text
+                          style={[
+                            styles.detailValue,
+                            customer.airtel_number &&
+                              styles.detailValueClickable,
+                          ]}
+                        >
+                          {customer.airtel_number
+                            ? formatPhoneNumber(customer.airtel_number)
+                            : "N/A"}
+                        </Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={styles.detailRow}
+                        onPress={() =>
+                          customer.alternate_number &&
+                          handleCallNumber(customer.alternate_number)
+                        }
+                        disabled={!customer.alternate_number}
+                        activeOpacity={customer.alternate_number ? 0.7 : 1}
                       >
-                        {customer.alternate_number
-                          ? formatPhoneNumber(customer.alternate_number)
-                          : "N/A"}
-                      </Text>
-                    </TouchableOpacity>
-                    <View style={styles.detailRow}>
-                      <Text style={styles.detailLabel}>Landmark</Text>
-                      <Text style={styles.detailValue}>
-                        {customer.delivery_landmark || "N/A"}
-                      </Text>
+                        <Text style={styles.detailLabel}>Alternate</Text>
+                        <Text
+                          style={[
+                            styles.detailValue,
+                            customer.alternate_number &&
+                              styles.detailValueClickable,
+                          ]}
+                        >
+                          {customer.alternate_number
+                            ? formatPhoneNumber(customer.alternate_number)
+                            : "N/A"}
+                        </Text>
+                      </TouchableOpacity>
+                      <View style={styles.detailRow}>
+                        <Text style={styles.detailLabel}>Landmark</Text>
+                        <Text style={styles.detailValue}>
+                          {customer.delivery_landmark || "N/A"}
+                        </Text>
+                      </View>
+                      <View style={styles.detailRow}>
+                        <Text style={styles.detailLabel}>Visit Date</Text>
+                        <Text style={styles.detailValue}>
+                          {customer.visit_date
+                            ? formatVisitDate(customer.visit_date)
+                            : "N/A"}
+                        </Text>
+                      </View>
+                      <View style={styles.detailRow}>
+                        <Text style={styles.detailLabel}>Visit Time</Text>
+                        <Text style={styles.detailValue}>
+                          {customer.visit_time || "N/A"}
+                        </Text>
+                      </View>
+                      <View style={styles.detailRow}>
+                        <Text style={styles.detailLabel}>
+                          Registration Date
+                        </Text>
+                        <Text style={styles.detailValue}>
+                          {customer.created_at
+                            ? formatRegistrationDate(customer.created_at)
+                            : "N/A"}
+                        </Text>
+                      </View>
                     </View>
-                    <View style={styles.detailRow}>
-                      <Text style={styles.detailLabel}>Visit Date</Text>
-                      <Text style={styles.detailValue}>
-                        {customer.visit_date
-                          ? formatVisitDate(customer.visit_date)
-                          : "N/A"}
-                      </Text>
-                    </View>
-                    <View style={styles.detailRow}>
-                      <Text style={styles.detailLabel}>Visit Time</Text>
-                      <Text style={styles.detailValue}>
-                        {customer.visit_time || "N/A"}
-                      </Text>
-                    </View>
-                    <View style={styles.detailRow}>
-                      <Text style={styles.detailLabel}>Registration Date</Text>
-                      <Text style={styles.detailValue}>
-                        {customer.created_at
-                          ? formatRegistrationDate(customer.created_at)
-                          : "N/A"}
-                      </Text>
-                    </View>
-                  </View>
-                )}
-              </View>
-            );
-          })
-        )}
+                  )}
+                </View>
+              );
+            })
+          )}
         </ScrollView>
       </View>
 
@@ -959,7 +968,7 @@ export default function CustomersScreen() {
               >
                 <Text style={styles.visitDateModalCancelText}>Cancel</Text>
               </TouchableOpacity>
-                  <Text style={styles.visitDateModalTitle}>Select Visit Date</Text>
+              <Text style={styles.visitDateModalTitle}>Select Visit Date</Text>
               <TouchableOpacity
                 onPress={() => {
                   if (selectedVisitDate) {
@@ -981,8 +990,16 @@ export default function CustomersScreen() {
                     setSelectedVisitDate(dateString);
                   }
                 }}
-                minDate={availableVisitDates.length > 0 ? availableVisitDates[0] : undefined}
-                maxDate={availableVisitDates.length > 0 ? availableVisitDates[availableVisitDates.length - 1] : undefined}
+                minDate={
+                  availableVisitDates.length > 0
+                    ? availableVisitDates[0]
+                    : undefined
+                }
+                maxDate={
+                  availableVisitDates.length > 0
+                    ? availableVisitDates[availableVisitDates.length - 1]
+                    : undefined
+                }
                 enableSwipeMonths={true}
                 theme={{
                   backgroundColor: "#1A1A1A",
@@ -1322,38 +1339,5 @@ const styles = StyleSheet.create({
   calendarContainer: {
     padding: 20,
     paddingTop: 0,
-  },
-  testWhatsAppContainer: {
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    alignItems: "center",
-  },
-  testWhatsAppButton: {
-    flexDirection: "row",
-    alignItems: "center",
-    backgroundColor: "#25D366",
-    paddingVertical: 12,
-    paddingHorizontal: 20,
-    borderRadius: 12,
-    minWidth: 200,
-    justifyContent: "center",
-  },
-  testWhatsAppButtonDisabled: {
-    opacity: 0.6,
-  },
-  testWhatsAppIcon: {
-    marginRight: 8,
-  },
-  testWhatsAppText: {
-    fontSize: 14,
-    fontFamily: "Inter_600SemiBold",
-    color: "#FFFFFF",
-  },
-  whatsAppMessageText: {
-    marginTop: 8,
-    fontSize: 12,
-    fontFamily: "Inter_400Regular",
-    color: "#9CA3AF",
-    textAlign: "center",
   },
 });

@@ -49,3 +49,5 @@ According to [Reanimated 4.x documentation](https://docs.swmansion.com/react-nat
 
 **Reference**: [Reanimated Getting Started](https://docs.swmansion.com/react-native-reanimated/docs/fundamentals/getting-started/)
 
+
+

@@ -2,19 +2,25 @@
   "expo": {
     "name": "Airtel Router",
     "slug": "airtel-Router",
-    "version": "1.0.0",
+    "version": "2.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "airtelrouter",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "buildNumber": "2"
     },
     "android": {
       "package": "com.airtel.router",
-      "versionCode": 1,
-      "permissions": ["CALL_PHONE", "INTERNET"],
+      "versionCode": 2,
+      "permissions": [
+        "CALL_PHONE",
+        "INTERNET",
+        "USE_BIOMETRIC",
+        "USE_FINGERPRINT"
+      ],
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
       "adaptiveIcon": {
@@ -50,6 +56,12 @@
       "eas": {
         "projectId": "7603a739-48d3-4620-adfb-52b131c727bf"
       }
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/7603a739-48d3-4620-adfb-52b131c727bf"
     }
   }
 }

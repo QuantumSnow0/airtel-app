@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "whatsapp-webhook": {
+      "verify_jwt": false
+    }
+  }
+}

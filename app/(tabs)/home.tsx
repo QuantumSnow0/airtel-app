@@ -1,7 +1,11 @@
 import { Ionicons } from "@expo/vector-icons";
 import * as Clipboard from "expo-clipboard";
+import { File, Paths } from "expo-file-system";
+import * as Sharing from "expo-sharing";
 import { useEffect, useState } from "react";
 import {
+  ActivityIndicator,
+  Alert,
   Linking,
   RefreshControl,
   ScrollView,
@@ -11,6 +15,7 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import * as XLSX from "xlsx";
 import { getSupabaseClient, isSupabaseConfigured } from "../../lib/supabase";
 
 interface Lead {
@@ -45,6 +50,8 @@ export default function HomeScreen() {
     [key: string]: "red" | "orange" | null;
   }>({});
   const [duplicateCount, setDuplicateCount] = useState<number>(0);
+  const [exporting, setExporting] = useState(false);
+  const [showExportMenu, setShowExportMenu] = useState(false);
 
   useEffect(() => {
     if (isSupabaseConfigured) {
@@ -501,12 +508,348 @@ export default function HomeScreen() {
     });
   };
 
+  // Get phone number in 254 format (12 digits) for SMS API
+  const getPhoneForSMS = (phone: string): string => {
+    if (!phone) return "";
+    // Remove any spaces, dashes, or + signs
+    let cleaned = phone.replace(/[\s\-\(\)\+]/g, "");
+
+    // If starts with 0, replace with 254 (e.g., 0712345678 -> 254712345678)
+    if (cleaned.startsWith("0")) {
+      cleaned = "254" + cleaned.substring(1);
+    }
+    // If doesn't start with 254, add it (assume it's a local number)
+    else if (!cleaned.startsWith("254")) {
+      cleaned = "254" + cleaned;
+    }
+
+    // Ensure it's exactly 12 digits (254 + 9 digits)
+    // If longer, truncate; if shorter, it's invalid
+    if (cleaned.length > 12) {
+      cleaned = cleaned.substring(0, 12);
+    } else if (cleaned.length < 12) {
+      // Invalid number, return empty string
+      return "";
+    }
+
+    return cleaned;
+  };
+
+  // Export SMS format Excel (exact format from image)
+  const exportSMSFormat = async (phoneType: "airtel" | "alternate") => {
+    if (!isSupabaseConfigured) {
+      Alert.alert("Error", "Supabase is not configured");
+      return;
+    }
+
+    setExporting(true);
+    try {
+      const supabase = getSupabaseClient();
+
+      // Fetch all customers
+      const { data: customers, error } = await supabase
+        .from("leads")
+        .select("airtel_number, alternate_number")
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        console.error("Error fetching customers:", error);
+        Alert.alert("Error", "Failed to fetch customers data");
+        return;
+      }
+
+      if (!customers || customers.length === 0) {
+        Alert.alert("No Data", "No customers found to export");
+        return;
+      }
+
+      // Format data for SMS API (exact format from image)
+      const excelData = customers
+        .map((customer) => {
+          const phone =
+            phoneType === "airtel"
+              ? customer.airtel_number
+              : customer.alternate_number;
+          const phoneForSMS = getPhoneForSMS(phone || "");
+
+          // Only include if phone number exists and is valid
+          if (!phoneForSMS || phoneForSMS.length !== 12) return null;
+
+          return {
+            "Cell Number": phoneForSMS,
+            Username: "",
+            "Order Id": "",
+            Currency: "",
+            Amount: "",
+          };
+        })
+        .filter((row) => row !== null); // Remove invalid entries
+
+      if (excelData.length === 0) {
+        Alert.alert("No Data", `No valid ${phoneType} numbers found to export`);
+        return;
+      }
+
+      // Add red dot in Currency column (first data row)
+      // In Excel, we'll set the cell value to a special marker, but for now just leave empty
+      // The red dot might need to be added manually or via cell styling
+
+      // Create workbook and worksheet
+      const ws = XLSX.utils.json_to_sheet(excelData);
+
+      // Set column widths to match the image
+      const columnWidths = [
+        { wch: 15 }, // Cell Number
+        { wch: 15 }, // Username
+        { wch: 15 }, // Order Id
+        { wch: 12 }, // Currency
+        { wch: 12 }, // Amount
+      ];
+      ws["!cols"] = columnWidths;
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "SMS Numbers");
+
+      // Generate Excel file buffer
+      const excelBuffer = XLSX.write(wb, {
+        type: "base64",
+        bookType: "xlsx",
+      });
+
+      // Create file name with timestamp
+      const timestamp = new Date().toISOString().split("T")[0];
+      const fileName = `SMS_Numbers_${phoneType}_${timestamp}.xlsx`;
+
+      // Use cache directory for temporary file
+      const file = new File(Paths.cache, fileName);
+
+      // Write file
+      file.write(excelBuffer, { encoding: "base64" });
+      const fileUri = file.uri;
+
+      // Share the file
+      const isAvailable = await Sharing.isAvailableAsync();
+      if (isAvailable) {
+        await Sharing.shareAsync(fileUri, {
+          mimeType:
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          dialogTitle: "Export SMS Numbers",
+        });
+      } else {
+        Alert.alert(
+          "Success",
+          `Excel file saved: ${fileName}\n\nFile location: ${fileUri}`
+        );
+      }
+    } catch (error) {
+      console.error("Error exporting SMS format:", error);
+      Alert.alert(
+        "Error",
+        `Failed to export Excel file: ${error instanceof Error ? error.message : "Unknown error"}`
+      );
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  // Toggle export menu
+  const handleExportToExcel = () => {
+    if (!isSupabaseConfigured) {
+      Alert.alert("Error", "Supabase is not configured");
+      return;
+    }
+    setShowExportMenu(!showExportMenu);
+  };
+
+  // Handle export option selection
+  const handleExportOption = (option: "full" | "airtel" | "alternate") => {
+    setShowExportMenu(false);
+    if (option === "full") {
+      exportFullDetails();
+    } else {
+      exportSMSFormat(option);
+    }
+  };
+
+  // Export full customer details
+  const exportFullDetails = async () => {
+    setExporting(true);
+    try {
+      const supabase = getSupabaseClient();
+
+      // Fetch all customers (excluding agent details)
+      const { data: customers, error } = await supabase
+        .from("leads")
+        .select(
+          "id, customer_name, airtel_number, alternate_number, email, preferred_package, installation_town, delivery_landmark, visit_date, visit_time, lead_type, connection_type, created_at"
+        )
+        .order("created_at", { ascending: false });
+
+      if (error) {
+        console.error("Error fetching customers:", error);
+        Alert.alert("Error", "Failed to fetch customers data");
+        return;
+      }
+
+      if (!customers || customers.length === 0) {
+        Alert.alert("No Data", "No customers found to export");
+        return;
+      }
+
+      // Format data for Excel (excluding agent details)
+      const excelData = customers.map((customer, index) => {
+        // Format phone numbers
+        const airtelFormatted = formatPhoneNumber(customer.airtel_number || "");
+        const alternateFormatted = formatPhoneNumber(
+          customer.alternate_number || ""
+        );
+
+        // Format dates
+        const visitDate = customer.visit_date
+          ? new Date(customer.visit_date).toLocaleDateString("en-GB", {
+              day: "2-digit",
+              month: "short",
+              year: "numeric",
+            })
+          : "";
+        const registrationDate = customer.created_at
+          ? new Date(customer.created_at).toLocaleDateString("en-GB", {
+              day: "2-digit",
+              month: "short",
+              year: "numeric",
+            })
+          : "";
+
+        return {
+          "#": index + 1,
+          "Customer Name": formatName(customer.customer_name || ""),
+          "Airtel Number": airtelFormatted,
+          "Alternate Number": alternateFormatted,
+          Email: customer.email || "",
+          Package: customer.preferred_package || "",
+          "Installation Town": customer.installation_town || "",
+          "Delivery Landmark": customer.delivery_landmark || "",
+          "Visit Date": visitDate,
+          "Visit Time": customer.visit_time || "",
+          "Lead Type": customer.lead_type || "",
+          "Connection Type": customer.connection_type || "",
+          "Registration Date": registrationDate,
+        };
+      });
+
+      // Create workbook and worksheet
+      const ws = XLSX.utils.json_to_sheet(excelData);
+
+      // Set column widths
+      const columnWidths = [
+        { wch: 5 }, // #
+        { wch: 25 }, // Customer Name
+        { wch: 15 }, // Airtel Number
+        { wch: 15 }, // Alternate Number
+        { wch: 25 }, // Email
+        { wch: 15 }, // Package
+        { wch: 20 }, // Installation Town
+        { wch: 25 }, // Delivery Landmark
+        { wch: 15 }, // Visit Date
+        { wch: 12 }, // Visit Time
+        { wch: 15 }, // Lead Type
+        { wch: 15 }, // Connection Type
+        { wch: 18 }, // Registration Date
+      ];
+      ws["!cols"] = columnWidths;
+
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Customers");
+
+      // Generate Excel file buffer
+      const excelBuffer = XLSX.write(wb, {
+        type: "base64",
+        bookType: "xlsx",
+      });
+
+      // Create file name with timestamp
+      const timestamp = new Date().toISOString().split("T")[0];
+      const fileName = `Airtel_Customers_${timestamp}.xlsx`;
+
+      // Use cache directory for temporary file
+      const file = new File(Paths.cache, fileName);
+
+      // Write file using the File API (write is synchronous, but we need to await the file creation)
+      file.write(excelBuffer, { encoding: "base64" });
+      const fileUri = file.uri;
+
+      // Share the file
+      const isAvailable = await Sharing.isAvailableAsync();
+      if (isAvailable) {
+        await Sharing.shareAsync(fileUri, {
+          mimeType:
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          dialogTitle: "Export Customers to Excel",
+        });
+      } else {
+        Alert.alert(
+          "Success",
+          `Excel file saved: ${fileName}\n\nFile location: ${fileUri}`
+        );
+      }
+    } catch (error) {
+      console.error("Error exporting to Excel:", error);
+      Alert.alert(
+        "Error",
+        `Failed to export Excel file: ${error instanceof Error ? error.message : "Unknown error"}`
+      );
+    } finally {
+      setExporting(false);
+    }
+  };
+
   return (
     <SafeAreaView style={styles.container}>
       {/* Header Section */}
       <View style={styles.header}>
         <Text style={styles.headerTitle}>Airtel Dashboard</Text>
-        <Text style={styles.headerDate}>{formatDate()}</Text>
+        <View style={styles.headerRight}>
+          <Text style={styles.headerDate}>{formatDate()}</Text>
+          <View style={styles.exportContainer}>
+            <TouchableOpacity
+              onPress={handleExportToExcel}
+              disabled={exporting}
+              style={styles.exportButton}
+            >
+              {exporting ? (
+                <ActivityIndicator size="small" color="#FFD700" />
+              ) : (
+                <Ionicons name="download-outline" size={20} color="#FFD700" />
+              )}
+            </TouchableOpacity>
+            {showExportMenu && (
+              <View style={styles.exportMenuOverlay}>
+                <View style={styles.exportMenu}>
+                  <TouchableOpacity
+                    style={styles.exportMenuItem}
+                    onPress={() => handleExportOption("full")}
+                  >
+                    <Text style={styles.exportMenuText}>Full Details</Text>
+                  </TouchableOpacity>
+                  <View style={styles.exportMenuSeparator} />
+                  <TouchableOpacity
+                    style={styles.exportMenuItem}
+                    onPress={() => handleExportOption("airtel")}
+                  >
+                    <Text style={styles.exportMenuText}>SMS (Airtel)</Text>
+                  </TouchableOpacity>
+                  <View style={styles.exportMenuSeparator} />
+                  <TouchableOpacity
+                    style={styles.exportMenuItem}
+                    onPress={() => handleExportOption("alternate")}
+                  >
+                    <Text style={styles.exportMenuText}>SMS (Alternate)</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            )}
+          </View>
+        </View>
       </View>
 
       {/* Main Content */}
@@ -728,12 +1071,57 @@ const styles = StyleSheet.create({
     fontFamily: "Montserrat_600SemiBold",
     color: "#FFD700", // Golden/yellow color
   },
+  headerRight: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+  },
   headerDate: {
     fontSize: 14,
     fontFamily: "Montserrat_400Regular",
     color: "#9CA3AF",
     textTransform: "lowercase",
     flexShrink: 0,
+  },
+  exportContainer: {
+    position: "relative",
+  },
+  exportButton: {
+    padding: 6,
+    borderRadius: 8,
+    backgroundColor: "rgba(255, 215, 0, 0.1)",
+  },
+  exportMenuOverlay: {
+    position: "absolute",
+    top: 40,
+    right: 0,
+    zIndex: 1000,
+  },
+  exportMenu: {
+    backgroundColor: "#1A1A1A",
+    borderRadius: 8,
+    minWidth: 160,
+    borderWidth: 1,
+    borderColor: "#2A2A2A",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 8,
+  },
+  exportMenuItem: {
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+  },
+  exportMenuText: {
+    fontSize: 14,
+    fontFamily: "Inter_400Regular",
+    color: "#FFFFFF",
+  },
+  exportMenuSeparator: {
+    height: 1,
+    backgroundColor: "#2A2A2A",
+    marginHorizontal: 8,
   },
   statsRow: {
     flexDirection: "row",

@@ -40,3 +40,5 @@ npx expo prebuild --clean
 
 This warning is telling us we're using incompatible versions. We should upgrade to match Expo SDK 54's expectations!
 
+
+

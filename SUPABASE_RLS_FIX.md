@@ -77,3 +77,5 @@ SELECT COUNT(*) FROM public.leads;
 
 **Most likely fix**: Create the RLS policy above to allow public read access.
 
+
+
