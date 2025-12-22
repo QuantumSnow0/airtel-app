@@ -15,6 +15,7 @@ import { Stack } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
 import { useEffect } from "react";
+import { dataPreloader } from "../lib/dataPreloader";
 import "../global.css";
 
 SplashScreen.preventAutoHideAsync();
@@ -33,6 +34,9 @@ export default function RootLayout() {
 
   useEffect(() => {
     if (fontsLoaded) {
+      // Start preloading data as soon as fonts are loaded
+      // This happens during splash screen
+      dataPreloader.preloadAll().catch(console.error);
       SplashScreen.hideAsync();
     }
   }, [fontsLoaded]);
@@ -46,6 +50,7 @@ export default function RootLayout() {
       <StatusBar style="light" hidden={true} />
       <Stack screenOptions={{ headerShown: false }}>
         <Stack.Screen name="index" />
+        <Stack.Screen name="onboarding" />
         <Stack.Screen name="auth" />
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
       </Stack>

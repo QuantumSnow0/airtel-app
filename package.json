@@ -1,7 +1,7 @@
 {
   "name": "airtel-router",
   "main": "expo-router/entry",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "scripts": {
     "start": "expo start",
     "reset-project": "node ./scripts/reset-project.js",
@@ -28,6 +28,7 @@
     "expo-image": "~3.0.10",
     "expo-linking": "~8.0.9",
     "expo-local-authentication": "^17.0.8",
+    "expo-notifications": "~0.32.14",
     "expo-router": "~6.0.16",
     "expo-secure-store": "^15.0.8",
     "expo-sharing": "^14.0.8",

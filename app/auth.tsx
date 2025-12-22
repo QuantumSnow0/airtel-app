@@ -22,6 +22,8 @@ import {
   verifyPIN,
   setBiometricEnabled,
 } from '../lib/auth';
+import { dataPreloader } from '../lib/dataPreloader';
+import { navigateAfterAuth } from '../lib/tutorial';
 
 export default function AuthScreen() {
   const insets = useSafeAreaInsets();
@@ -35,6 +37,11 @@ export default function AuthScreen() {
 
   useEffect(() => {
     checkAuthStatus();
+    // Continue preloading data during authentication
+    // Data might already be loading, but ensure it continues
+    if (!dataPreloader.isDataLoading()) {
+      dataPreloader.preloadAll().catch(console.error);
+    }
   }, []);
 
   const checkAuthStatus = async () => {
@@ -60,7 +67,7 @@ export default function AuthScreen() {
     if (result.success) {
       await setBiometricEnabled(true);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      router.replace('/(tabs)/home');
+      navigateAfterAuth();
     } else {
       // Biometric failed or cancelled, show PIN fallback
       setShowPinInput(true);
@@ -104,7 +111,7 @@ export default function AuthScreen() {
               text: 'Skip',
               style: 'cancel',
               onPress: () => {
-                router.replace('/(tabs)/home');
+                navigateAfterAuth();
               },
             },
             {
@@ -113,23 +120,23 @@ export default function AuthScreen() {
                 await setBiometricEnabled(true);
                 const result = await authenticateWithBiometrics();
                 if (result.success) {
-                  router.replace('/(tabs)/home');
+                  navigateAfterAuth();
                 } else {
-                  router.replace('/(tabs)/home');
+                  navigateAfterAuth();
                 }
               },
             },
           ]
         );
       } else {
-        router.replace('/(tabs)/home');
+        navigateAfterAuth();
       }
     } else {
       // Verifying PIN
       const isValid = await verifyPIN(pin);
       if (isValid) {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        router.replace('/(tabs)/home');
+        navigateAfterAuth();
       } else {
         setPinError('Incorrect PIN');
         setPin('');

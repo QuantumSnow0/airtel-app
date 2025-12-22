@@ -2,7 +2,7 @@
   "expo": {
     "name": "Airtel Router",
     "slug": "airtel-Router",
-    "version": "2.0.0",
+    "version": "3.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "airtelrouter",
@@ -10,16 +10,17 @@
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
-      "buildNumber": "2"
+      "buildNumber": "3"
     },
     "android": {
       "package": "com.airtel.router",
-      "versionCode": 2,
+      "versionCode": 3,
       "permissions": [
         "CALL_PHONE",
         "INTERNET",
         "USE_BIOMETRIC",
-        "USE_FINGERPRINT"
+        "USE_FINGERPRINT",
+        "RECEIVE_BOOT_COMPLETED"
       ],
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,

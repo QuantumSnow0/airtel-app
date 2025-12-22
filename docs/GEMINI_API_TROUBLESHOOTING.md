@@ -46,3 +46,7 @@ If Gemini continues to have issues, we can switch to OpenAI:
 
 Let me know if you want me to implement OpenAI as an alternative!
 
+
+
+
+

@@ -92,3 +92,7 @@ If you encounter issues during build:
 3. Check EAS project configuration: `eas project:info`
 4. Review build logs in Expo dashboard
 
+
+
+
+

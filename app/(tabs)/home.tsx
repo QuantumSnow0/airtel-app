@@ -1,12 +1,14 @@
 import { Ionicons } from "@expo/vector-icons";
 import * as Clipboard from "expo-clipboard";
 import { File, Paths } from "expo-file-system";
+import * as Notifications from "expo-notifications";
 import * as Sharing from "expo-sharing";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
   Linking,
+  Modal,
   RefreshControl,
   ScrollView,
   StyleSheet,
@@ -14,8 +16,10 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
+import { Calendar } from "react-native-calendars";
 import { SafeAreaView } from "react-native-safe-area-context";
 import * as XLSX from "xlsx";
+import { dataPreloader } from "../../lib/dataPreloader";
 import { getSupabaseClient, isSupabaseConfigured } from "../../lib/supabase";
 
 interface Lead {
@@ -50,12 +54,117 @@ export default function HomeScreen() {
     [key: string]: "red" | "orange" | null;
   }>({});
   const [duplicateCount, setDuplicateCount] = useState<number>(0);
+  const [todayDuplicateCount, setTodayDuplicateCount] = useState<number>(0);
   const [exporting, setExporting] = useState(false);
   const [showExportMenu, setShowExportMenu] = useState(false);
+  const [showFilterModal, setShowFilterModal] = useState(false);
+  const [selectedTown, setSelectedTown] = useState<string | null>(null); // null = All towns
+  const [dateFilter, setDateFilter] = useState<"today" | "all" | "custom">(
+    "all"
+  );
+  const [selectedDate, setSelectedDate] = useState<string | null>(null); // YYYY-MM-DD format
+  const [showDatePicker, setShowDatePicker] = useState(false);
+  const [availableTowns, setAvailableTowns] = useState<string[]>([]);
+  const [showTownList, setShowTownList] = useState(false);
+  const [pendingExportOption, setPendingExportOption] = useState<
+    "full" | "airtel" | "alternate" | null
+  >(null);
+
+  // Fetch available towns for filter
+  const fetchTowns = useCallback(async () => {
+    console.log(
+      "🔍 fetchTowns called, isSupabaseConfigured:",
+      isSupabaseConfigured
+    );
+    if (!isSupabaseConfigured) {
+      console.log("⚠️ Supabase not configured, skipping town fetch");
+      return;
+    }
+
+    try {
+      const supabase = getSupabaseClient();
+      console.log("📡 Fetching towns from database...");
+      const { data, error } = await supabase
+        .from("leads")
+        .select("installation_town")
+        .order("installation_town", { ascending: true });
+
+      if (error) {
+        console.error("❌ Error fetching towns:", error);
+        setAvailableTowns([]);
+      } else {
+        console.log("✅ Raw data received:", data?.length, "rows");
+        // Get unique towns
+        const uniqueTowns = Array.from(
+          new Set(data?.map((item) => item.installation_town) || [])
+        ).filter((town) => town && town.trim() !== "");
+        console.log(
+          "🏙️ Fetched",
+          uniqueTowns.length,
+          "unique towns:",
+          uniqueTowns
+        );
+        setAvailableTowns(uniqueTowns);
+      }
+    } catch (error) {
+      console.error("❌ Exception in fetchTowns:", error);
+      setAvailableTowns([]);
+    }
+  }, []);
+
+  // Fetch towns on mount - separate useEffect
+  useEffect(() => {
+    console.log("🚀 Component mounted, calling fetchTowns...");
+    fetchTowns();
+  }, [fetchTowns]);
 
   useEffect(() => {
+    // Request notification permissions
+    const setupNotifications = async () => {
+      const { status: existingStatus } =
+        await Notifications.getPermissionsAsync();
+      let finalStatus = existingStatus;
+
+      if (existingStatus !== "granted") {
+        const { status } = await Notifications.requestPermissionsAsync();
+        finalStatus = status;
+      }
+
+      if (finalStatus !== "granted") {
+        console.log("Notification permissions not granted");
+        return;
+      }
+
+      // Configure notification handler
+      Notifications.setNotificationHandler({
+        handleNotification: async () => ({
+          shouldShowAlert: true,
+          shouldPlaySound: true,
+          shouldSetBadge: true,
+          shouldShowBanner: true,
+          shouldShowList: true,
+        }),
+      });
+    };
+
+    setupNotifications();
+
     if (isSupabaseConfigured) {
-      fetchCounts();
+      // Check if data was preloaded
+      const preloadedData = dataPreloader.getHomeData();
+
+      if (preloadedData) {
+        // Use preloaded data immediately - no loading state needed!
+        setTotalCount(preloadedData.totalCount);
+        setTodayCount(preloadedData.todayCount);
+        setYesterdayCount(preloadedData.yesterdayCount);
+        setLeads(preloadedData.leads);
+        setLoading(false);
+        console.log("Using preloaded home data - instant load!");
+      } else {
+        // Data not preloaded yet, fetch normally
+        fetchCounts();
+      }
 
       // Set up Realtime subscription
       const supabase = getSupabaseClient();
@@ -64,12 +173,45 @@ export default function HomeScreen() {
         .on(
           "postgres_changes",
           {
-            event: "*", // Listen to all events (INSERT, UPDATE, DELETE)
+            event: "INSERT", // Only listen to INSERT events for new customers
             schema: "public",
             table: "leads",
           },
-          (payload) => {
+          async (payload) => {
+            const newLead = payload.new as Lead;
+
+            // Check if the new customer was registered today
+            const leadDate = new Date(newLead.created_at);
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            leadDate.setHours(0, 0, 0, 0);
+
+            if (leadDate.getTime() === today.getTime()) {
+              // New customer registered today - send notification
+              await Notifications.scheduleNotificationAsync({
+                content: {
+                  title: "New Customer Registered! 🎉",
+                  body: `${newLead.customer_name || "A new customer"} just signed up today`,
+                  sound: true,
+                  data: { leadId: newLead.id },
+                },
+                trigger: null, // Show immediately
+              });
+            }
+
             // Refetch counts when any change occurs (without showing loading)
+            fetchCounts(false);
+          }
+        )
+        .on(
+          "postgres_changes",
+          {
+            event: "UPDATE", // Also listen to UPDATE events
+            schema: "public",
+            table: "leads",
+          },
+          () => {
+            // Refetch counts when any update occurs
             fetchCounts(false);
           }
         )
@@ -450,8 +592,37 @@ export default function HomeScreen() {
         totalExtras += group.length - 1;
       });
       setDuplicateCount(totalExtras);
+
+      // Calculate today's duplicate count
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      let todayExtras = 0;
+
+      duplicateGroups.forEach((group) => {
+        const groupLeads = group
+          .map((id) => leads.find((l) => l.id === id))
+          .filter(Boolean) as Lead[];
+        const todayLeadsInGroup = groupLeads.filter((lead) => {
+          const leadDate = new Date(lead.created_at);
+          leadDate.setHours(0, 0, 0, 0);
+          return leadDate.getTime() === today.getTime();
+        });
+
+        if (todayLeadsInGroup.length > 0) {
+          // If multiple today's leads in same duplicate group, count extras
+          if (todayLeadsInGroup.length > 1) {
+            todayExtras += todayLeadsInGroup.length - 1;
+          } else if (groupLeads.length > 1) {
+            // One today's lead is duplicate of older lead(s) - count it
+            todayExtras += 1;
+          }
+        }
+      });
+
+      setTodayDuplicateCount(todayExtras);
     } else {
       setDuplicateCount(0);
+      setTodayDuplicateCount(0);
     }
   }, [leads]);
 
@@ -536,7 +707,11 @@ export default function HomeScreen() {
   };
 
   // Export SMS format Excel (exact format from image)
-  const exportSMSFormat = async (phoneType: "airtel" | "alternate") => {
+  const exportSMSFormat = async (
+    phoneType: "airtel" | "alternate",
+    town: string | null = null,
+    dateFilterType: "today" | "all" | string = "all"
+  ) => {
     if (!isSupabaseConfigured) {
       Alert.alert("Error", "Supabase is not configured");
       return;
@@ -546,11 +721,40 @@ export default function HomeScreen() {
     try {
       const supabase = getSupabaseClient();
 
-      // Fetch all customers
-      const { data: customers, error } = await supabase
+      // Build query with filters
+      let query = supabase
         .from("leads")
         .select("airtel_number, alternate_number")
         .order("created_at", { ascending: false });
+
+      // Apply town filter
+      if (town) {
+        query = query.eq("installation_town", town);
+      }
+
+      // Apply date filter
+      if (dateFilterType === "today") {
+        const todayDate = new Date();
+        todayDate.setHours(0, 0, 0, 0);
+        const todayStart = todayDate.toISOString();
+        const tomorrow = new Date(todayDate);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        const tomorrowStart = tomorrow.toISOString();
+        query = query
+          .gte("created_at", todayStart)
+          .lt("created_at", tomorrowStart);
+      } else if (dateFilterType !== "all") {
+        // Custom date (YYYY-MM-DD format)
+        const selectedDateObj = new Date(dateFilterType);
+        selectedDateObj.setHours(0, 0, 0, 0);
+        const dateStart = selectedDateObj.toISOString();
+        const nextDay = new Date(selectedDateObj);
+        nextDay.setDate(nextDay.getDate() + 1);
+        const dateEnd = nextDay.toISOString();
+        query = query.gte("created_at", dateStart).lt("created_at", dateEnd);
+      }
+
+      const { data: customers, error } = await query;
 
       if (error) {
         console.error("Error fetching customers:", error);
@@ -616,9 +820,16 @@ export default function HomeScreen() {
         bookType: "xlsx",
       });
 
-      // Create file name with timestamp
+      // Create file name with filters
       const timestamp = new Date().toISOString().split("T")[0];
-      const fileName = `SMS_Numbers_${phoneType}_${timestamp}.xlsx`;
+      const townPart = town ? `_${town.replace(/\s+/g, "_")}` : "";
+      let datePart = "";
+      if (dateFilterType === "today") {
+        datePart = "_Today";
+      } else if (dateFilterType !== "all") {
+        datePart = `_${dateFilterType}`;
+      }
+      const fileName = `SMS_Numbers_${phoneType}${townPart}${datePart}_${timestamp}.xlsx`;
 
       // Use cache directory for temporary file
       const file = new File(Paths.cache, fileName);
@@ -661,29 +872,125 @@ export default function HomeScreen() {
     setShowExportMenu(!showExportMenu);
   };
 
-  // Handle export option selection
-  const handleExportOption = (option: "full" | "airtel" | "alternate") => {
-    setShowExportMenu(false);
+  // Handle export option selection - open filter modal (memoized)
+  const handleExportOption = useCallback(
+    (option: "full" | "airtel" | "alternate") => {
+      setShowExportMenu(false);
+      setPendingExportOption(option);
+      // Reset filters to default
+      setSelectedTown(null);
+      setDateFilter("all");
+      setSelectedDate(null);
+      setShowTownList(false);
+      // Open filter modal
+      setShowFilterModal(true);
+    },
+    []
+  );
+
+  // Memoized modal close handler
+  const handleCloseModal = useCallback(() => {
+    setShowFilterModal(false);
+    setPendingExportOption(null);
+  }, []);
+
+  // Apply filters and export (memoized to prevent re-creation)
+  const handleApplyFiltersAndExport = useCallback(() => {
+    setShowFilterModal(false);
+    const option = pendingExportOption;
+    if (!option) return;
+
+    // Determine date filter value
+    let dateFilterValue: "today" | "all" | string = "all";
+    if (dateFilter === "today") {
+      dateFilterValue = "today";
+    } else if (dateFilter === "custom" && selectedDate) {
+      dateFilterValue = selectedDate;
+    }
+
+    // Export with filters
     if (option === "full") {
-      exportFullDetails();
+      exportFullDetails(selectedTown, dateFilterValue);
     } else {
-      exportSMSFormat(option);
+      exportSMSFormat(option, selectedTown, dateFilterValue);
+    }
+
+    setPendingExportOption(null);
+  }, [pendingExportOption, dateFilter, selectedDate, selectedTown]);
+
+  // Format date for display
+  const formatSelectedDate = (dateString: string | null) => {
+    if (!dateString) return "";
+    try {
+      const date = new Date(dateString);
+      const day = date.getDate();
+      const monthNames = [
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun",
+        "Jul",
+        "Aug",
+        "Sep",
+        "Oct",
+        "Nov",
+        "Dec",
+      ];
+      const monthName = monthNames[date.getMonth()];
+      const year = date.getFullYear();
+      return `${day} ${monthName} ${year}`;
+    } catch (error) {
+      return dateString;
     }
   };
 
   // Export full customer details
-  const exportFullDetails = async () => {
+  const exportFullDetails = async (
+    town: string | null = null,
+    dateFilterType: "today" | "all" | string = "all"
+  ) => {
     setExporting(true);
     try {
       const supabase = getSupabaseClient();
 
-      // Fetch all customers (excluding agent details)
-      const { data: customers, error } = await supabase
+      // Build query with filters
+      let query = supabase
         .from("leads")
         .select(
-          "id, customer_name, airtel_number, alternate_number, email, preferred_package, installation_town, delivery_landmark, visit_date, visit_time, lead_type, connection_type, created_at"
+          "id, customer_name, airtel_number, alternate_number, email, preferred_package, installation_town, delivery_landmark, visit_date, visit_time, created_at"
         )
         .order("created_at", { ascending: false });
+
+      // Apply town filter
+      if (town) {
+        query = query.eq("installation_town", town);
+      }
+
+      // Apply date filter
+      if (dateFilterType === "today") {
+        const todayDate = new Date();
+        todayDate.setHours(0, 0, 0, 0);
+        const todayStart = todayDate.toISOString();
+        const tomorrow = new Date(todayDate);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        const tomorrowStart = tomorrow.toISOString();
+        query = query
+          .gte("created_at", todayStart)
+          .lt("created_at", tomorrowStart);
+      } else if (dateFilterType !== "all") {
+        // Custom date (YYYY-MM-DD format)
+        const selectedDateObj = new Date(dateFilterType);
+        selectedDateObj.setHours(0, 0, 0, 0);
+        const dateStart = selectedDateObj.toISOString();
+        const nextDay = new Date(selectedDateObj);
+        nextDay.setDate(nextDay.getDate() + 1);
+        const dateEnd = nextDay.toISOString();
+        query = query.gte("created_at", dateStart).lt("created_at", dateEnd);
+      }
+
+      const { data: customers, error } = await query;
 
       if (error) {
         console.error("Error fetching customers:", error);
@@ -712,13 +1019,6 @@ export default function HomeScreen() {
               year: "numeric",
             })
           : "";
-        const registrationDate = customer.created_at
-          ? new Date(customer.created_at).toLocaleDateString("en-GB", {
-              day: "2-digit",
-              month: "short",
-              year: "numeric",
-            })
-          : "";
 
         return {
           "#": index + 1,
@@ -731,9 +1031,6 @@ export default function HomeScreen() {
           "Delivery Landmark": customer.delivery_landmark || "",
           "Visit Date": visitDate,
           "Visit Time": customer.visit_time || "",
-          "Lead Type": customer.lead_type || "",
-          "Connection Type": customer.connection_type || "",
-          "Registration Date": registrationDate,
         };
       });
 
@@ -752,9 +1049,6 @@ export default function HomeScreen() {
         { wch: 25 }, // Delivery Landmark
         { wch: 15 }, // Visit Date
         { wch: 12 }, // Visit Time
-        { wch: 15 }, // Lead Type
-        { wch: 15 }, // Connection Type
-        { wch: 18 }, // Registration Date
       ];
       ws["!cols"] = columnWidths;
 
@@ -767,9 +1061,16 @@ export default function HomeScreen() {
         bookType: "xlsx",
       });
 
-      // Create file name with timestamp
+      // Create file name with filters
       const timestamp = new Date().toISOString().split("T")[0];
-      const fileName = `Airtel_Customers_${timestamp}.xlsx`;
+      const townPart = town ? `_${town.replace(/\s+/g, "_")}` : "";
+      let datePart = "";
+      if (dateFilterType === "today") {
+        datePart = "_Today";
+      } else if (dateFilterType !== "all") {
+        datePart = `_${dateFilterType}`;
+      }
+      const fileName = `Airtel_Customers${townPart}${datePart}_${timestamp}.xlsx`;
 
       // Use cache directory for temporary file
       const file = new File(Paths.cache, fileName);
@@ -814,7 +1115,7 @@ export default function HomeScreen() {
             <TouchableOpacity
               onPress={handleExportToExcel}
               disabled={exporting}
-              style={styles.exportButton}
+              style={styles.exportIconButton}
             >
               {exporting ? (
                 <ActivityIndicator size="small" color="#FFD700" />
@@ -861,33 +1162,41 @@ export default function HomeScreen() {
               <Text style={styles.countTextToday}>-</Text>
             ) : (
               <Text style={styles.countTextToday}>
-                {todayCount !== null ? todayCount : 0}
+                {todayCount !== null
+                  ? Math.max(0, todayCount - todayDuplicateCount)
+                  : 0}
               </Text>
             )}
             {!loading && todayCount !== null && yesterdayCount !== null && (
               <View style={styles.trendContainer}>
                 <Ionicons
                   name={
-                    todayCount > yesterdayCount
+                    todayCount - todayDuplicateCount > yesterdayCount
                       ? "trending-up"
                       : "trending-down"
                   }
                   size={20}
-                  color={todayCount > yesterdayCount ? "#10B981" : "#EF4444"}
+                  color={
+                    todayCount - todayDuplicateCount > yesterdayCount
+                      ? "#10B981"
+                      : "#EF4444"
+                  }
                   style={styles.trendIcon}
                 />
                 {yesterdayCount > 0 && (
                   <Text
                     style={[
                       styles.percentageText,
-                      todayCount > yesterdayCount
+                      todayCount - todayDuplicateCount > yesterdayCount
                         ? styles.percentageTextGreen
                         : styles.percentageTextRed,
                     ]}
                   >
                     {Math.abs(
                       Math.round(
-                        ((todayCount - yesterdayCount) / yesterdayCount) * 100
+                        ((todayCount - todayDuplicateCount - yesterdayCount) /
+                          yesterdayCount) *
+                          100
                       )
                     )}
                     %
@@ -907,14 +1216,11 @@ export default function HomeScreen() {
           {loading ? (
             <Text style={styles.countText}>-</Text>
           ) : (
-            <View style={styles.countContainer}>
-              <Text style={styles.countText}>
-                {totalCount !== null ? totalCount : 0}
-              </Text>
-              {duplicateCount > 0 && (
-                <Text style={styles.duplicateCountText}>-{duplicateCount}</Text>
-              )}
-            </View>
+            <Text style={styles.countText}>
+              {totalCount !== null
+                ? Math.max(0, totalCount - duplicateCount)
+                : 0}
+            </Text>
           )}
           <Text style={styles.labelText}>total registered</Text>
         </View>
@@ -1048,6 +1354,262 @@ export default function HomeScreen() {
           )}
         </ScrollView>
       </View>
+
+      {/* Filter Modal */}
+      <Modal
+        visible={showFilterModal}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={handleCloseModal}
+      >
+        <TouchableOpacity
+          style={styles.modalOverlay}
+          activeOpacity={1}
+          onPress={handleCloseModal}
+        >
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Export Filters</Text>
+              <TouchableOpacity
+                onPress={handleCloseModal}
+                style={styles.modalCloseButton}
+              >
+                <Ionicons name="close" size={24} color="#FFFFFF" />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView
+              style={styles.modalBody}
+              showsVerticalScrollIndicator={true}
+            >
+              {/* Town Filter */}
+              <View style={styles.filterSection}>
+                <Text style={styles.filterLabel}>Town</Text>
+                <TouchableOpacity
+                  style={styles.townDropdownContainer}
+                  onPress={() => {
+                    console.log(
+                      "🏙️ Dropdown clicked, current showTownList:",
+                      showTownList,
+                      "availableTowns:",
+                      availableTowns.length
+                    );
+                    setShowTownList((prev) => !prev);
+                  }}
+                  activeOpacity={0.7}
+                >
+                  <View style={styles.townDropdownHeader}>
+                    <Text style={styles.townDropdownHeaderText}>
+                      {selectedTown || "All Towns"}
+                    </Text>
+                    <Ionicons
+                      name={showTownList ? "chevron-up" : "chevron-down"}
+                      size={20}
+                      color="#FFD700"
+                    />
+                  </View>
+                </TouchableOpacity>
+                {showTownList && (
+                  <ScrollView
+                    style={styles.townListContainer}
+                    nestedScrollEnabled={true}
+                    showsVerticalScrollIndicator={true}
+                  >
+                    <TouchableOpacity
+                      style={[
+                        styles.modalItem,
+                        selectedTown === null && styles.modalItemActive,
+                      ]}
+                      onPress={() => {
+                        setSelectedTown(null);
+                        setShowTownList(false);
+                      }}
+                    >
+                      <Text
+                        style={[
+                          styles.modalItemText,
+                          selectedTown === null && styles.modalItemTextActive,
+                        ]}
+                      >
+                        All Towns
+                      </Text>
+                      {selectedTown === null && (
+                        <Ionicons name="checkmark" size={20} color="#FFD700" />
+                      )}
+                    </TouchableOpacity>
+                    {availableTowns.length === 0 ? (
+                      <View style={styles.modalItem}>
+                        <Text style={styles.modalItemText}>
+                          No towns available
+                        </Text>
+                      </View>
+                    ) : (
+                      availableTowns.map((town) => (
+                        <TouchableOpacity
+                          key={town}
+                          style={[
+                            styles.modalItem,
+                            selectedTown === town && styles.modalItemActive,
+                          ]}
+                          onPress={() => {
+                            setSelectedTown(town);
+                            setShowTownList(false);
+                          }}
+                        >
+                          <Text
+                            style={[
+                              styles.modalItemText,
+                              selectedTown === town &&
+                                styles.modalItemTextActive,
+                            ]}
+                          >
+                            {town}
+                          </Text>
+                          {selectedTown === town && (
+                            <Ionicons
+                              name="checkmark"
+                              size={20}
+                              color="#FFD700"
+                            />
+                          )}
+                        </TouchableOpacity>
+                      ))
+                    )}
+                  </ScrollView>
+                )}
+              </View>
+
+              {/* Date Filter */}
+              <View style={styles.filterSection}>
+                <Text style={styles.filterLabel}>Date</Text>
+                <View style={styles.dateButtonsRow}>
+                  <TouchableOpacity
+                    style={[
+                      styles.dateButton,
+                      dateFilter === "all" && styles.dateButtonSelected,
+                    ]}
+                    onPress={() => {
+                      setDateFilter("all");
+                      setSelectedDate(null);
+                      setShowDatePicker(false);
+                    }}
+                    activeOpacity={0.7}
+                  >
+                    <Text
+                      style={[
+                        styles.dateButtonText,
+                        dateFilter === "all" && styles.dateButtonTextSelected,
+                      ]}
+                    >
+                      All Time
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[
+                      styles.dateButton,
+                      dateFilter === "today" && styles.dateButtonSelected,
+                    ]}
+                    onPress={() => {
+                      setDateFilter("today");
+                      setSelectedDate(null);
+                      setShowDatePicker(false);
+                    }}
+                    activeOpacity={0.7}
+                  >
+                    <Text
+                      style={[
+                        styles.dateButtonText,
+                        dateFilter === "today" && styles.dateButtonTextSelected,
+                      ]}
+                    >
+                      Today
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[
+                      styles.dateButton,
+                      dateFilter === "custom" && styles.dateButtonSelected,
+                    ]}
+                    onPress={() => {
+                      setDateFilter("custom");
+                      setShowDatePicker(!showDatePicker);
+                    }}
+                    activeOpacity={0.7}
+                  >
+                    <Text
+                      style={[
+                        styles.dateButtonText,
+                        dateFilter === "custom" &&
+                          styles.dateButtonTextSelected,
+                      ]}
+                    >
+                      {selectedDate
+                        ? formatSelectedDate(selectedDate)
+                        : "Custom"}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+                {dateFilter === "custom" && showDatePicker && (
+                  <View style={styles.calendarWrapper}>
+                    <Calendar
+                      onDayPress={(day) => {
+                        setSelectedDate(day.dateString);
+                      }}
+                      markedDates={{
+                        [selectedDate || ""]: {
+                          selected: true,
+                          selectedColor: "#FFD700",
+                          selectedTextColor: "#000000",
+                        },
+                      }}
+                      theme={{
+                        backgroundColor: "#0A0A0A",
+                        calendarBackground: "#0A0A0A",
+                        textSectionTitleColor: "#9CA3AF",
+                        selectedDayBackgroundColor: "#FFD700",
+                        selectedDayTextColor: "#000000",
+                        todayTextColor: "#FFD700",
+                        dayTextColor: "#FFFFFF",
+                        textDisabledColor: "#4B5563",
+                        dotColor: "#FFD700",
+                        selectedDotColor: "#000000",
+                        arrowColor: "#FFD700",
+                        monthTextColor: "#FFFFFF",
+                        indicatorColor: "#FFD700",
+                        textDayFontFamily: "Inter_400Regular",
+                        textMonthFontFamily: "Montserrat_600SemiBold",
+                        textDayHeaderFontFamily: "Inter_600SemiBold",
+                        textDayFontSize: 14,
+                        textMonthFontSize: 16,
+                        textDayHeaderFontSize: 12,
+                      }}
+                      enableSwipeMonths={true}
+                    />
+                  </View>
+                )}
+              </View>
+            </ScrollView>
+
+            <View style={styles.modalFooter}>
+              <TouchableOpacity
+                style={styles.cancelButton}
+                onPress={() => {
+                  setShowFilterModal(false);
+                  setPendingExportOption(null);
+                }}
+              >
+                <Text style={styles.cancelButtonText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.exportButton}
+                onPress={handleApplyFiltersAndExport}
+              >
+                <Text style={styles.exportButtonText}>Export</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </TouchableOpacity>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -1086,7 +1648,7 @@ const styles = StyleSheet.create({
   exportContainer: {
     position: "relative",
   },
-  exportButton: {
+  exportIconButton: {
     padding: 6,
     borderRadius: 8,
     backgroundColor: "rgba(255, 215, 0, 0.1)",
@@ -1288,5 +1850,225 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontFamily: "Inter_400Regular",
     color: "#6B7280",
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0, 0, 0, 0.7)",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  modalContent: {
+    backgroundColor: "#1A1A1A",
+    borderRadius: 16,
+    width: "85%",
+    maxHeight: "80%",
+    borderWidth: 1,
+    borderColor: "#2A2A2A",
+  },
+  modalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: "#2A2A2A",
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontFamily: "Montserrat_600SemiBold",
+    color: "#FFD700",
+  },
+  modalBody: {
+    maxHeight: 500,
+    padding: 20,
+  },
+  filterSection: {
+    marginBottom: 24,
+  },
+  filterLabel: {
+    fontSize: 16,
+    fontFamily: "Inter_600SemiBold",
+    color: "#FFFFFF",
+    marginBottom: 12,
+  },
+  townDropdownContainer: {
+    marginBottom: 12,
+  },
+  townDropdownHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    backgroundColor: "#0A0A0A",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#FFD700",
+  },
+  townDropdownHeaderText: {
+    fontSize: 14,
+    fontFamily: "Inter_600SemiBold",
+    color: "#FFD700",
+  },
+  townListContainer: {
+    maxHeight: 250,
+    backgroundColor: "#0A0A0A",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#2A2A2A",
+    overflow: "hidden",
+  },
+  dateButtonsRow: {
+    flexDirection: "row",
+    gap: 12,
+    marginBottom: 12,
+  },
+  dateButton: {
+    flex: 1,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    backgroundColor: "#0A0A0A",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#2A2A2A",
+    alignItems: "center",
+  },
+  dateButtonSelected: {
+    backgroundColor: "rgba(255, 215, 0, 0.1)",
+    borderColor: "#FFD700",
+  },
+  dateButtonText: {
+    fontSize: 14,
+    fontFamily: "Inter_400Regular",
+    color: "#9CA3AF",
+  },
+  dateButtonTextSelected: {
+    color: "#FFD700",
+    fontFamily: "Inter_600SemiBold",
+  },
+  calendarWrapper: {
+    marginTop: 12,
+    backgroundColor: "#0A0A0A",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#2A2A2A",
+    overflow: "hidden",
+  },
+  modalFooter: {
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    gap: 12,
+    padding: 20,
+    borderTopWidth: 1,
+    borderTopColor: "#2A2A2A",
+  },
+  cancelButton: {
+    paddingVertical: 10,
+    paddingHorizontal: 20,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#2A2A2A",
+  },
+  cancelButtonText: {
+    fontSize: 14,
+    fontFamily: "Inter_600SemiBold",
+    color: "#9CA3AF",
+  },
+  exportButton: {
+    paddingVertical: 10,
+    paddingHorizontal: 24,
+    borderRadius: 8,
+    backgroundColor: "#FFD700",
+  },
+  exportButtonText: {
+    fontSize: 14,
+    fontFamily: "Inter_600SemiBold",
+    color: "#000000",
+  },
+  modalList: {
+    maxHeight: 400,
+  },
+  modalItem: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingVertical: 16,
+    paddingHorizontal: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: "#2A2A2A",
+  },
+  modalItemActive: {
+    backgroundColor: "rgba(255, 215, 0, 0.1)",
+  },
+  modalItemText: {
+    fontSize: 16,
+    fontFamily: "Inter_400Regular",
+    color: "#FFFFFF",
+  },
+  modalItemTextActive: {
+    color: "#FFD700",
+    fontFamily: "Inter_600SemiBold",
+  },
+  modalCloseButton: {
+    padding: 4,
+  },
+  dateModalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0, 0, 0, 0.7)",
+    justifyContent: "flex-end",
+  },
+  dateModalContent: {
+    backgroundColor: "#1A1A1A",
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    paddingBottom: 40,
+    maxHeight: "90%",
+  },
+  dateModalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: "#2A2A2A",
+  },
+  dateModalTitle: {
+    fontSize: 18,
+    fontFamily: "Montserrat_600SemiBold",
+    color: "#FFFFFF",
+    flex: 1,
+    textAlign: "center",
+  },
+  dateModalCancel: {
+    padding: 4,
+  },
+  dateModalCancelText: {
+    fontSize: 16,
+    fontFamily: "Inter_400Regular",
+    color: "#9CA3AF",
+  },
+  dateModalDone: {
+    padding: 4,
+  },
+  dateModalDoneText: {
+    fontSize: 16,
+    fontFamily: "Inter_600SemiBold",
+    color: "#FFD700",
+  },
+  quickDateButton: {
+    padding: 12,
+    marginHorizontal: 20,
+    marginTop: 20,
+    marginBottom: 10,
+    backgroundColor: "#0A0A0A",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#2A2A2A",
+    alignItems: "center",
+  },
+  quickDateButtonText: {
+    fontSize: 14,
+    fontFamily: "Inter_600SemiBold",
+    color: "#FFD700",
   },
 });

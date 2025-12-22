@@ -99,3 +99,7 @@ export async function setBiometricEnabled(enabled: boolean): Promise<void> {
   await SecureStore.setItemAsync(BIOMETRIC_ENABLED_KEY, enabled ? 'true' : 'false');
 }
 
+
+
+
+

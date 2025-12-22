@@ -1,4 +1,6 @@
 import { Ionicons } from "@expo/vector-icons";
+import * as Clipboard from "expo-clipboard";
+import * as Haptics from "expo-haptics";
 import { useNavigation } from "expo-router";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
@@ -6,6 +8,7 @@ import {
   Alert,
   Animated,
   BackHandler,
+  Image,
   KeyboardAvoidingView,
   Modal,
   Platform,
@@ -42,6 +45,7 @@ interface Customer {
   status?: string; // 'new' for unrecognized customers
   source?: string; // 'whatsapp_inbound' for auto-created leads
   needs_agent_review?: boolean; // Flagged for agent review
+  is_pinned?: boolean; // Pinned conversation
 }
 
 interface Conversation {
@@ -114,6 +118,10 @@ export default function MessagesScreen() {
   const [editingCustomer, setEditingCustomer] = useState<Customer | null>(null);
   const chatScrollViewRef = useRef<ScrollView>(null);
   const slideAnim = useRef(new Animated.Value(0)).current;
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [selectedMessageForAction, setSelectedMessageForAction] = useState<WhatsAppMessage | null>(null);
+  const [showMessageActionMenu, setShowMessageActionMenu] = useState(false);
+  const [longPressedConversation, setLongPressedConversation] = useState<string | null>(null);
 
   // Hide/show tab bar when chat is open/closed
   useLayoutEffect(() => {
@@ -211,6 +219,81 @@ export default function MessagesScreen() {
     });
   };
 
+  // Format date for separator (Today, Yesterday, or full date)
+  const formatDateSeparator = (dateString: string) => {
+    const date = new Date(dateString);
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const messageDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+
+    if (messageDate.getTime() === today.getTime()) {
+      return "Today";
+    } else if (messageDate.getTime() === yesterday.getTime()) {
+      return "Yesterday";
+    } else {
+      return date.toLocaleDateString("en-US", {
+        weekday: "long",
+        month: "long",
+        day: "numeric",
+        year: date.getFullYear() !== now.getFullYear() ? "numeric" : undefined,
+      });
+    }
+  };
+
+  // Check if two dates are on different days
+  const isDifferentDay = (date1: string, date2: string) => {
+    const d1 = new Date(date1);
+    const d2 = new Date(date2);
+    return (
+      d1.getFullYear() !== d2.getFullYear() ||
+      d1.getMonth() !== d2.getMonth() ||
+      d1.getDate() !== d2.getDate()
+    );
+  };
+
+  // Copy message to clipboard
+  const handleCopyMessage = async (message: WhatsAppMessage) => {
+    try {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+      await Clipboard.setString(message.message_body);
+      Alert.alert("Copied", "Message copied to clipboard");
+      setShowMessageActionMenu(false);
+      setSelectedMessageForAction(null);
+    } catch (error) {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      Alert.alert("Error", "Failed to copy message");
+    }
+  };
+
+  // Quick reply templates
+  const quickReplyTemplates = [
+    "Thank you for your message. We'll get back to you shortly.",
+    "We've received your message and will look into it.",
+    "Thank you for choosing Airtel. How can we assist you today?",
+    "We apologize for the inconvenience. Please call us at 0733100500 for immediate assistance.",
+    "Your request has been noted. Our team will contact you soon.",
+  ];
+
+  // Handle quick reply selection
+  const handleQuickReply = (template: string) => {
+    setMessageText(template);
+  };
+
+  // Scroll to bottom
+  const scrollToBottom = () => {
+    chatScrollViewRef.current?.scrollToEnd({ animated: true });
+  };
+
+  // Handle scroll position for scroll to bottom button
+  const handleScroll = (event: any) => {
+    const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+    const isNearBottom =
+      contentOffset.y + layoutMeasurement.height >= contentSize.height - 100;
+    setShowScrollToBottom(!isNearBottom);
+  };
+
   // Format submission date as "5th nov 2025"
   const formatSubmissionDate = (dateString: string) => {
     if (!dateString) return "";
@@ -255,7 +338,7 @@ export default function MessagesScreen() {
       let customersQuery = supabase
         .from("leads")
         .select(
-          "id, customer_name, installation_town, airtel_number, alternate_number, preferred_package, whatsapp_response, whatsapp_response_date, whatsapp_message_sent_date, created_at, status, source"
+          "id, customer_name, installation_town, airtel_number, alternate_number, preferred_package, whatsapp_response, whatsapp_response_date, whatsapp_message_sent_date, created_at, status, source, is_pinned"
         );
 
       // Apply search filter
@@ -345,13 +428,17 @@ export default function MessagesScreen() {
         // We'll handle this by checking messages after fetching
       }
 
-      const { data: customers, error: customersError } = await customersQuery;
-
+      // Fetch fresh data
+      const { data: fetchedCustomers, error: customersError } = await customersQuery;
+      
       if (customersError) {
         console.error("Error fetching customers:", customersError);
         setConversations([]);
+        if (showLoadingState) setLoading(false);
         return;
       }
+      
+      const customers = fetchedCustomers || [];
 
       // Optimize: Fetch all messages for all customers in one query
       const customerIds = (customers || []).map((c) => c.id);
@@ -445,6 +532,7 @@ export default function MessagesScreen() {
             customer: {
               ...customer,
               needs_agent_review: hasFlaggedMessage,
+              is_pinned: customer.is_pinned === true, // Ensure boolean, default to false
             },
             lastMessage: lastMsg
               ? {
@@ -459,8 +547,15 @@ export default function MessagesScreen() {
         }
       );
 
-      // Sort by last message time (most recent first)
+      // Sort: pinned first, then by last message time (most recent first)
       conversationsWithMessages.sort((a, b) => {
+        // Pinned conversations first
+        const aPinned = a.customer.is_pinned === true;
+        const bPinned = b.customer.is_pinned === true;
+        if (aPinned && !bPinned) return -1;
+        if (!aPinned && bPinned) return 1;
+
+        // Then sort by last message time
         if (!a.lastMessage && !b.lastMessage) return 0;
         if (!a.lastMessage) return 1;
         if (!b.lastMessage) return -1;
@@ -649,6 +744,7 @@ export default function MessagesScreen() {
   // Handle conversation selection
   const handleSelectConversation = (conversation: Conversation) => {
     if (multiSelectMode) {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
       const newSelected = new Set(selectedIds);
       if (newSelected.has(conversation.customer.id)) {
         newSelected.delete(conversation.customer.id);
@@ -657,8 +753,79 @@ export default function MessagesScreen() {
       }
       setSelectedIds(newSelected);
     } else {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
       setSelectedCustomer(conversation.customer);
       fetchChatMessages(conversation.customer);
+    }
+  };
+
+  // Toggle pin status
+  const handleTogglePin = async (customer: Customer, event?: any) => {
+    if (event) {
+      event.stopPropagation();
+    }
+    if (!isSupabaseConfigured) {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      Alert.alert("Error", "Database not configured");
+      return;
+    }
+
+    try {
+      // Haptic feedback when starting pin action
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      const supabase = getSupabaseClient();
+      const newPinStatus = customer.is_pinned !== true;
+
+      console.log("Toggling pin:", {
+        customerId: customer.id,
+        currentStatus: customer.is_pinned,
+        newStatus: newPinStatus,
+      });
+
+      const { data, error } = await supabase
+        .from("leads")
+        .update({ is_pinned: newPinStatus })
+        .eq("id", customer.id)
+        .select("id, is_pinned");
+
+      if (error) {
+        console.error("Pin toggle error:", error);
+        console.error("Error details:", JSON.stringify(error, null, 2));
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+        Alert.alert(
+          "Error",
+          `Failed to update pin status: ${error.message || "Unknown error"}\n\nCode: ${error.code || "N/A"}\n\nMake sure you've run the database migration to add the is_pinned field.`
+        );
+        return;
+      }
+
+      console.log("Pin update response:", data);
+      console.log("Pin updated successfully - new status:", newPinStatus);
+      
+      // Success haptic feedback
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      
+      // Close the long-press menu
+      setLongPressedConversation(null);
+      
+      // Update the customer object in state if it's currently selected
+      if (selectedCustomer && selectedCustomer.id === customer.id) {
+        setSelectedCustomer({
+          ...selectedCustomer,
+          is_pinned: newPinStatus,
+        });
+      }
+      
+      // Refresh conversations to reflect the change
+      await fetchConversations(false);
+    } catch (error: any) {
+      console.error("Pin toggle exception:", error);
+      console.error("Exception details:", JSON.stringify(error, null, 2));
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      Alert.alert(
+        "Error",
+        `Failed to update pin status: ${error?.message || "Unknown error"}\n\nMake sure you've run the database migration.`
+      );
     }
   };
 
@@ -698,6 +865,7 @@ export default function MessagesScreen() {
         {
           text: "Send",
           onPress: async () => {
+            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
             setSendingBatch(true);
             let successCount = 0;
             let failCount = 0;
@@ -738,6 +906,15 @@ export default function MessagesScreen() {
             setMultiSelectMode(false);
             setSelectedIds(new Set());
 
+            // Haptic feedback based on results
+            if (failCount === 0) {
+              Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+            } else if (successCount === 0) {
+              Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+            } else {
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+            }
+
             Alert.alert(
               "Batch Send Complete",
               `Sent: ${successCount}\nFailed: ${failCount}`
@@ -768,14 +945,17 @@ export default function MessagesScreen() {
       });
 
       if (result.success) {
+        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
         setMessageText("");
         await fetchChatMessages(selectedCustomer);
         // Also refresh conversation list to update last message preview
         fetchConversations(false);
       } else {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
         Alert.alert("Error", result.error || "Failed to send message");
       }
     } catch (error: any) {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       Alert.alert("Error", error.message || "Failed to send message");
     } finally {
       setSendingText(false);
@@ -784,8 +964,10 @@ export default function MessagesScreen() {
 
   // Send template message
   const handleSendTemplate = async (customer: Customer) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     const phoneNumber = customer.alternate_number || customer.airtel_number;
     if (!phoneNumber) {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       Alert.alert("Error", "Customer does not have a phone number");
       return;
     }
@@ -805,6 +987,7 @@ export default function MessagesScreen() {
       });
 
       if (result.success) {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
         Alert.alert("Success", "Template message sent!");
         if (selectedCustomer?.id === customer.id) {
           await fetchChatMessages(customer);
@@ -812,9 +995,11 @@ export default function MessagesScreen() {
         // Refresh conversation list to update last message preview
         fetchConversations(false);
       } else {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
         Alert.alert("Error", result.error || "Failed to send message");
       }
     } catch (error: any) {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       Alert.alert("Error", error.message || "Failed to send message");
     }
   };
@@ -935,6 +1120,8 @@ export default function MessagesScreen() {
               style={styles.chatMessages}
               contentContainerStyle={styles.chatMessagesContent}
               showsVerticalScrollIndicator={false}
+              onScroll={handleScroll}
+              scrollEventThrottle={16}
             >
               {chatMessages.length === 0 ? (
                 <View style={styles.chatEmptyContainer}>
@@ -949,9 +1136,13 @@ export default function MessagesScreen() {
                   </Text>
                 </View>
               ) : (
-                chatMessages.map((message) => {
+                chatMessages.map((message, index) => {
                   const isOutbound = message.direction === "outbound";
                   const status = message.status || "sent";
+                  const prevMessage = index > 0 ? chatMessages[index - 1] : null;
+                  const showDateSeparator =
+                    !prevMessage ||
+                    isDifferentDay(message.created_at, prevMessage.created_at);
 
                   const getReadReceiptIcon = () => {
                     if (!isOutbound) return null;
@@ -1002,62 +1193,115 @@ export default function MessagesScreen() {
                   };
 
                   return (
-                    <View
-                      key={message.id}
-                      style={[
-                        styles.messageBubble,
-                        isOutbound
-                          ? styles.messageBubbleOutbound
-                          : styles.messageBubbleInbound,
-                      ]}
-                    >
-                      {message.is_ai_response && (
-                        <View style={styles.aiBadge}>
-                          <Ionicons name="sparkles" size={12} color="#0A0A0A" />
-                          <Text style={styles.aiBadgeText}>AI</Text>
+                    <View key={message.id}>
+                      {showDateSeparator && (
+                        <View style={styles.dateSeparator}>
+                          <View style={styles.dateSeparatorLine} />
+                          <Text style={styles.dateSeparatorText}>
+                            {formatDateSeparator(message.created_at)}
+                          </Text>
+                          <View style={styles.dateSeparatorLine} />
                         </View>
                       )}
-                      <Text
-                        style={[
-                          styles.messageText,
-                          isOutbound
-                            ? styles.messageTextOutbound
-                            : styles.messageTextInbound,
-                        ]}
+                      <TouchableOpacity
+                        onLongPress={() => {
+                          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                          setSelectedMessageForAction(message);
+                          setShowMessageActionMenu(true);
+                        }}
+                        activeOpacity={0.9}
                       >
-                        {message.message_body}
-                      </Text>
-                      {message.message_type === "button_click" &&
-                        message.button_text && (
+                        <View
+                          style={[
+                            styles.messageBubble,
+                            isOutbound
+                              ? styles.messageBubbleOutbound
+                              : styles.messageBubbleInbound,
+                          ]}
+                        >
+                          {message.is_ai_response && (
+                            <View style={styles.aiBadge}>
+                              <Ionicons name="sparkles" size={12} color="#0A0A0A" />
+                              <Text style={styles.aiBadgeText}>AI</Text>
+                            </View>
+                          )}
                           <Text
                             style={[
                               styles.messageText,
                               isOutbound
                                 ? styles.messageTextOutbound
                                 : styles.messageTextInbound,
-                              { fontStyle: "italic", marginTop: 4 },
                             ]}
                           >
-                            {message.button_text}
+                            {message.message_body}
                           </Text>
-                        )}
-                      <View style={styles.messageFooter}>
-                        <Text
-                          style={[
-                            styles.messageTime,
-                            isOutbound
-                              ? styles.messageTimeOutbound
-                              : styles.messageTimeInbound,
-                          ]}
-                        >
-                          {formatMessageTime(message.created_at)}
-                        </Text>
-                        {getReadReceiptIcon()}
-                      </View>
+                          {message.message_type === "button_click" &&
+                            message.button_text && (
+                              <Text
+                                style={[
+                                  styles.messageText,
+                                  isOutbound
+                                    ? styles.messageTextOutbound
+                                    : styles.messageTextInbound,
+                                  { fontStyle: "italic", marginTop: 4 },
+                                ]}
+                              >
+                                {message.button_text}
+                              </Text>
+                            )}
+                          <View style={styles.messageFooter}>
+                            <Text
+                              style={[
+                                styles.messageTime,
+                                isOutbound
+                                  ? styles.messageTimeOutbound
+                                  : styles.messageTimeInbound,
+                              ]}
+                            >
+                              {formatMessageTime(message.created_at)}
+                            </Text>
+                            {getReadReceiptIcon()}
+                          </View>
+                        </View>
+                      </TouchableOpacity>
                     </View>
                   );
                 })
               )}
+            </ScrollView>
+          )}
+
+          {/* Scroll to Bottom Button */}
+          {showScrollToBottom && (
+            <TouchableOpacity
+              style={styles.scrollToBottomButton}
+              onPress={scrollToBottom}
+              activeOpacity={0.8}
+            >
+              <Ionicons name="arrow-down" size={20} color="#FFFFFF" />
+            </TouchableOpacity>
+          )}
+
+          {/* Quick Reply Templates */}
+          {chatMessages.length > 0 && (
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              style={styles.quickReplyContainer}
+              contentContainerStyle={styles.quickReplyContent}
+            >
+              {quickReplyTemplates.map((template, index) => (
+                <TouchableOpacity
+                  key={index}
+                  style={styles.quickReplyChip}
+                  onPress={() => handleQuickReply(template)}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.quickReplyText} numberOfLines={1}>
+                    {template}
+                  </Text>
+                </TouchableOpacity>
+              ))}
             </ScrollView>
           )}
 
@@ -1093,6 +1337,52 @@ export default function MessagesScreen() {
               )}
             </TouchableOpacity>
           </View>
+
+          {/* Message Action Menu */}
+          <Modal
+            visible={showMessageActionMenu}
+            transparent
+            animationType="fade"
+            onRequestClose={() => {
+              setShowMessageActionMenu(false);
+              setSelectedMessageForAction(null);
+            }}
+          >
+            <TouchableOpacity
+              style={styles.modalOverlay}
+              activeOpacity={1}
+              onPress={() => {
+                setShowMessageActionMenu(false);
+                setSelectedMessageForAction(null);
+              }}
+            >
+              <View style={styles.messageActionMenu}>
+                <TouchableOpacity
+                  style={styles.messageActionItem}
+                  onPress={() => {
+                    if (selectedMessageForAction) {
+                      handleCopyMessage(selectedMessageForAction);
+                    }
+                  }}
+                >
+                  <Ionicons name="copy-outline" size={20} color="#FFFFFF" />
+                  <Text style={styles.messageActionText}>Copy</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.messageActionItem}
+                  onPress={() => {
+                    setShowMessageActionMenu(false);
+                    setSelectedMessageForAction(null);
+                  }}
+                >
+                  <Ionicons name="close" size={20} color="#9CA3AF" />
+                  <Text style={[styles.messageActionText, { color: "#9CA3AF" }]}>
+                    Cancel
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </TouchableOpacity>
+          </Modal>
 
           {/* Customer Info Panel */}
           <Modal
@@ -1393,11 +1683,17 @@ export default function MessagesScreen() {
                       ? styles.conversationRowSelectedUnread
                       : styles.conversationRowSelected),
                 ]}
-                onPress={() => handleSelectConversation(conversation)}
+                onPress={() => {
+                  if (longPressedConversation === conversation.customer.id) {
+                    setLongPressedConversation(null);
+                  } else {
+                    handleSelectConversation(conversation);
+                  }
+                }}
                 onLongPress={() => {
                   if (!multiSelectMode) {
-                    setMultiSelectMode(true);
-                    setSelectedIds(new Set([conversation.customer.id]));
+                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                    setLongPressedConversation(conversation.customer.id);
                   }
                 }}
                 activeOpacity={0.7}
@@ -1421,18 +1717,56 @@ export default function MessagesScreen() {
                 <View style={styles.conversationContent}>
                   <View style={styles.conversationHeader}>
                     <View style={styles.conversationNameContainer}>
-                      <Text
-                        style={[
-                          styles.conversationName,
-                          conversation.unreadCount > 0 &&
-                            styles.conversationNameUnread,
-                        ]}
-                        numberOfLines={1}
-                      >
-                        {formatName(conversation.customer.customer_name)}
-                      </Text>
-                      {conversation.unreadCount > 0 && (
-                        <View style={styles.unreadDot} />
+                      <View style={styles.conversationNameRow}>
+                        <Text
+                          style={[
+                            styles.conversationName,
+                            conversation.unreadCount > 0 &&
+                              styles.conversationNameUnread,
+                          ]}
+                          numberOfLines={1}
+                        >
+                          {formatName(conversation.customer.customer_name)}
+                        </Text>
+                        {conversation.customer.is_pinned === true && 
+                         longPressedConversation !== conversation.customer.id && (
+                          <Image
+                            source={require("../../assets/images/pin.png")}
+                            style={styles.pinIcon}
+                            resizeMode="contain"
+                          />
+                        )}
+                        {conversation.unreadCount > 0 && (
+                          <View style={styles.unreadDot} />
+                        )}
+                      </View>
+                      {!multiSelectMode && longPressedConversation === conversation.customer.id && (
+                        <View style={styles.conversationActions}>
+                          <TouchableOpacity
+                            onPress={async (e) => {
+                              e.stopPropagation();
+                              await handleTogglePin(conversation.customer, e);
+                            }}
+                            style={styles.pinButton}
+                            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                          >
+                            <Image
+                              source={require("../../assets/images/pin.png")}
+                              style={[
+                                styles.pinButtonIcon,
+                                conversation.customer.is_pinned === true && styles.pinButtonIconActive
+                              ]}
+                              resizeMode="contain"
+                            />
+                          </TouchableOpacity>
+                          <TouchableOpacity
+                            onPress={() => setLongPressedConversation(null)}
+                            style={styles.closeActionButton}
+                            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                          >
+                            <Ionicons name="close" size={16} color="#9CA3AF" />
+                          </TouchableOpacity>
+                        </View>
                       )}
                     </View>
                     {conversation.lastMessage && (
@@ -1728,7 +2062,39 @@ const styles = StyleSheet.create({
     flex: 1,
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "space-between",
     marginRight: 8,
+  },
+  conversationNameRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    flex: 1,
+    gap: 6,
+  },
+  pinIcon: {
+    width: 14,
+    height: 14,
+    marginLeft: 4,
+  },
+  pinButtonIcon: {
+    width: 18,
+    height: 18,
+    opacity: 0.6,
+  },
+  pinButtonIconActive: {
+    opacity: 1,
+  },
+  conversationActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginLeft: 8,
+  },
+  pinButton: {
+    padding: 6,
+  },
+  closeActionButton: {
+    padding: 4,
   },
   conversationName: {
     flex: 1,
@@ -2065,5 +2431,86 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontFamily: "Inter_700Bold",
     color: "#0A0A0A",
+  },
+  // Date separator
+  dateSeparator: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginVertical: 16,
+    paddingHorizontal: 16,
+  },
+  dateSeparatorLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: "#2A2A2A",
+  },
+  dateSeparatorText: {
+    fontSize: 12,
+    fontFamily: "Inter_500Medium",
+    color: "#9CA3AF",
+    marginHorizontal: 12,
+  },
+  // Scroll to bottom button
+  scrollToBottomButton: {
+    position: "absolute",
+    bottom: 100,
+    right: 16,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: "#FFD700",
+    justifyContent: "center",
+    alignItems: "center",
+    elevation: 4,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+  },
+  // Quick reply templates
+  quickReplyContainer: {
+    maxHeight: 60,
+    borderTopWidth: 1,
+    borderTopColor: "#1F1F1F",
+    backgroundColor: "#0A0A0A",
+  },
+  quickReplyContent: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    gap: 8,
+  },
+  quickReplyChip: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 20,
+    backgroundColor: "#1F1F1F",
+    borderWidth: 1,
+    borderColor: "#2A2A2A",
+  },
+  quickReplyText: {
+    fontSize: 13,
+    fontFamily: "Inter_400Regular",
+    color: "#FFFFFF",
+    maxWidth: 200,
+  },
+  // Message action menu
+  messageActionMenu: {
+    backgroundColor: "#1A1A1A",
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    paddingVertical: 12,
+    paddingBottom: 20,
+  },
+  messageActionItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 20,
+    paddingVertical: 16,
+    gap: 12,
+  },
+  messageActionText: {
+    fontSize: 16,
+    fontFamily: "Inter_400Regular",
+    color: "#FFFFFF",
   },
 });

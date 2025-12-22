@@ -27,3 +27,7 @@ WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_auto_reply_queue_message_id 
 ON auto_reply_queue(message_id);
 
+
+
+
+
