@@ -3,10 +3,12 @@ import * as Clipboard from "expo-clipboard";
 import { File, Paths } from "expo-file-system";
 import * as Notifications from "expo-notifications";
 import * as Sharing from "expo-sharing";
-import { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  Animated,
+  Dimensions,
   Linking,
   Modal,
   RefreshControl,
@@ -17,10 +19,12 @@ import {
   View,
 } from "react-native";
 import { Calendar } from "react-native-calendars";
+import { LineChart } from "react-native-chart-kit";
 import { SafeAreaView } from "react-native-safe-area-context";
 import * as XLSX from "xlsx";
 import { dataPreloader } from "../../lib/dataPreloader";
 import { getSupabaseClient, isSupabaseConfigured } from "../../lib/supabase";
+import { handleSupabaseError } from "../../lib/supabase-error-handler";
 
 interface Lead {
   id: string;
@@ -40,6 +44,8 @@ interface Lead {
   lead_type?: string;
   connection_type?: string;
   created_at: string;
+  bypass_duplicate_check?: boolean;
+  resubmitted?: boolean;
 }
 
 export default function HomeScreen() {
@@ -50,6 +56,39 @@ export default function HomeScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [copiedNumberId, setCopiedNumberId] = useState<string | null>(null);
+  const [dailyData, setDailyData] = useState<{ date: string; count: number }[]>([]);
+  const [graphDateRange, setGraphDateRange] = useState<"7d" | "30d" | "90d" | "custom">("7d");
+  const [graphLoading, setGraphLoading] = useState(false);
+  const graphRequestIdRef = useRef(0);
+  const loadingBarAnimation = useRef(new Animated.Value(0)).current;
+
+  // Animate loading bar when graphLoading changes
+  useEffect(() => {
+    if (graphLoading) {
+      // Start animation loop
+      const animate = () => {
+        Animated.sequence([
+          Animated.timing(loadingBarAnimation, {
+            toValue: 1,
+            duration: 1000,
+            useNativeDriver: false,
+          }),
+          Animated.timing(loadingBarAnimation, {
+            toValue: 0,
+            duration: 0,
+            useNativeDriver: false,
+          }),
+        ]).start(() => {
+          if (graphLoading) {
+            animate();
+          }
+        });
+      };
+      animate();
+    } else {
+      loadingBarAnimation.setValue(0);
+    }
+  }, [graphLoading, loadingBarAnimation]);
   const [duplicateStatus, setDuplicateStatus] = useState<{
     [key: string]: "red" | "orange" | null;
   }>({});
@@ -83,27 +122,20 @@ export default function HomeScreen() {
 
     try {
       const supabase = getSupabaseClient();
-      console.log("📡 Fetching towns from database...");
       const { data, error } = await supabase
         .from("leads")
         .select("installation_town")
         .order("installation_town", { ascending: true });
 
       if (error) {
-        console.error("❌ Error fetching towns:", error);
+        console.error("Error fetching towns:", error);
+        handleSupabaseError(error);
         setAvailableTowns([]);
       } else {
-        console.log("✅ Raw data received:", data?.length, "rows");
         // Get unique towns
         const uniqueTowns = Array.from(
           new Set(data?.map((item) => item.installation_town) || [])
         ).filter((town) => town && town.trim() !== "");
-        console.log(
-          "🏙️ Fetched",
-          uniqueTowns.length,
-          "unique towns:",
-          uniqueTowns
-        );
         setAvailableTowns(uniqueTowns);
       }
     } catch (error) {
@@ -226,6 +258,145 @@ export default function HomeScreen() {
     }
   }, []);
 
+  // Separate function to fetch graph data to avoid race conditions with state updates
+  const fetchGraphData = async (range: "7d" | "30d" | "90d" | "custom") => {
+    // Increment request ID to track the latest request
+    graphRequestIdRef.current += 1;
+    const currentRequestId = graphRequestIdRef.current;
+    
+    try {
+      const supabase = getSupabaseClient();
+      
+      // Always use current date at the time of fetch to ensure consistency
+      const fetchTime = new Date();
+      fetchTime.setHours(0, 0, 0, 0);
+      const endDate = new Date(fetchTime);
+      endDate.setDate(endDate.getDate() + 1); // Tomorrow
+      endDate.setHours(0, 0, 0, 0);
+      
+      let startDate: Date;
+      let daysToProcess: number;
+      
+      if (range === "7d") {
+        startDate = new Date(fetchTime);
+        startDate.setDate(startDate.getDate() - 7);
+        daysToProcess = 7;
+      } else if (range === "30d") {
+        startDate = new Date(fetchTime);
+        startDate.setDate(startDate.getDate() - 30);
+        daysToProcess = 30;
+      } else {
+        // 90d - aggregate by week
+        startDate = new Date(fetchTime);
+        startDate.setDate(startDate.getDate() - 90);
+        daysToProcess = 13; // 13 weeks
+      }
+      
+      startDate.setHours(0, 0, 0, 0);
+      
+      // Fetch all data in one query
+      const { data: allLeads, error: graphError } = await supabase
+        .from("leads")
+        .select("created_at")
+        .gte("created_at", startDate.toISOString())
+        .lt("created_at", endDate.toISOString())
+        .neq("resubmitted", true);
+      
+      // Check if this is still the latest request (ignore stale requests)
+      if (currentRequestId !== graphRequestIdRef.current) {
+        console.log(`Ignoring stale graph data request for range: ${range}`);
+        return;
+      }
+      
+      if (graphError) {
+        console.error("Error fetching graph data:", graphError);
+        // Only update state if this is still the latest request
+        if (currentRequestId === graphRequestIdRef.current) {
+          setDailyData([]);
+        }
+        return;
+      }
+      
+      if (!allLeads) {
+        // Only update state if this is still the latest request
+        if (currentRequestId === graphRequestIdRef.current) {
+          setDailyData([]);
+        }
+        return;
+      }
+      
+      if (range === "90d") {
+        // Group by week (13 weeks)
+        const weekMap = new Map<string, number>();
+        
+        // Initialize all weeks
+        for (let week = 0; week < 13; week++) {
+          const weekStart = new Date(startDate);
+          weekStart.setDate(weekStart.getDate() + (week * 7));
+          weekStart.setHours(0, 0, 0, 0);
+          weekMap.set(weekStart.toISOString().split("T")[0], 0);
+        }
+        
+        // Group leads by week
+        allLeads.forEach((lead) => {
+          const leadDate = new Date(lead.created_at);
+          const daysDiff = Math.floor((leadDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24));
+          const weekIndex = Math.min(Math.max(0, Math.floor(daysDiff / 7)), 12);
+          const weekStart = new Date(startDate);
+          weekStart.setDate(weekStart.getDate() + (weekIndex * 7));
+          weekStart.setHours(0, 0, 0, 0);
+          const weekKey = weekStart.toISOString().split("T")[0];
+          weekMap.set(weekKey, (weekMap.get(weekKey) || 0) + 1);
+        });
+        
+        const results = Array.from(weekMap.entries())
+          .map(([date, count]) => ({ date, count }))
+          .sort((a, b) => a.date.localeCompare(b.date));
+        
+        // Double-check this is still the latest request before updating state
+        if (currentRequestId === graphRequestIdRef.current) {
+          setDailyData(results);
+        }
+      } else {
+        // Group by day for 7d and 30d
+        const dateMap = new Map<string, number>();
+        
+        // Initialize all days
+        for (let i = 0; i < daysToProcess; i++) {
+          const date = new Date(startDate);
+          date.setDate(date.getDate() + i);
+          date.setHours(0, 0, 0, 0);
+          dateMap.set(date.toISOString().split("T")[0], 0);
+        }
+        
+        // Group leads by date
+        allLeads.forEach((lead) => {
+          const leadDate = new Date(lead.created_at);
+          leadDate.setHours(0, 0, 0, 0);
+          const dateKey = leadDate.toISOString().split("T")[0];
+          if (dateMap.has(dateKey)) {
+            dateMap.set(dateKey, (dateMap.get(dateKey) || 0) + 1);
+          }
+        });
+        
+        const results = Array.from(dateMap.entries())
+          .map(([date, count]) => ({ date, count }))
+          .sort((a, b) => a.date.localeCompare(b.date));
+        
+        // Double-check this is still the latest request before updating state
+        if (currentRequestId === graphRequestIdRef.current) {
+          setDailyData(results);
+        }
+      }
+    } catch (error) {
+      // Only update state if this is still the latest request
+      if (currentRequestId === graphRequestIdRef.current) {
+        console.error("Error in fetchGraphData:", error);
+        setDailyData([]);
+      }
+    }
+  };
+
   const fetchCounts = async (showLoading = true) => {
     if (!isSupabaseConfigured) {
       setLoading(false);
@@ -238,95 +409,88 @@ export default function HomeScreen() {
       }
       const supabase = getSupabaseClient();
 
-      // Fetch total count
-      const { count: total, error: totalError } = await supabase
-        .from("leads")
-        .select("*", { count: "exact", head: true });
-
-      if (totalError) {
-        console.error("Error fetching total count:", {
-          error: totalError,
-          message: totalError.message,
-          details: totalError.details,
-          hint: totalError.hint,
-          code: totalError.code,
-        });
-        setTotalCount(0);
-      } else {
-        setTotalCount(total || 0);
-      }
-
-      // Fetch today's count
+      // Prepare date ranges
       const todayDate = new Date();
       todayDate.setHours(0, 0, 0, 0);
       const todayStart = todayDate.toISOString();
       const tomorrow = new Date(todayDate);
       tomorrow.setDate(tomorrow.getDate() + 1);
       const tomorrowStart = tomorrow.toISOString();
-
-      const { count: todayCount, error: todayError } = await supabase
-        .from("leads")
-        .select("*", { count: "exact", head: true })
-        .gte("created_at", todayStart)
-        .lt("created_at", tomorrowStart);
-
-      if (todayError) {
-        console.error("Error fetching today's count:", {
-          error: todayError,
-          message: todayError.message,
-          details: todayError.details,
-          hint: todayError.hint,
-          code: todayError.code,
-        });
-        setTodayCount(0);
-      } else {
-        setTodayCount(todayCount || 0);
-      }
-
-      // Fetch yesterday's count
       const yesterdayDate = new Date(todayDate);
       yesterdayDate.setDate(yesterdayDate.getDate() - 1);
       const yesterdayStart = yesterdayDate.toISOString();
 
-      const { count: yesterdayCount, error: yesterdayError } = await supabase
-        .from("leads")
-        .select("*", { count: "exact", head: true })
-        .gte("created_at", yesterdayStart)
-        .lt("created_at", todayStart);
+      // Run all count queries in parallel for better performance
+      const [totalResult, todayResult, yesterdayResult, leadsResult] = await Promise.all([
+        // Total count (excluding resubmitted)
+        supabase
+          .from("leads")
+          .select("*", { count: "exact", head: true })
+          .neq("resubmitted", true),
+        
+        // Today's count
+        supabase
+          .from("leads")
+          .select("*", { count: "exact", head: true })
+          .gte("created_at", todayStart)
+          .lt("created_at", tomorrowStart)
+          .neq("resubmitted", true),
+        
+        // Yesterday's count
+        supabase
+          .from("leads")
+          .select("*", { count: "exact", head: true })
+          .gte("created_at", yesterdayStart)
+          .lt("created_at", todayStart)
+          .neq("resubmitted", true),
+        
+        // Fetch leads data (limit to recent 200 for performance)
+        supabase
+          .from("leads")
+          .select(
+            "id, customer_name, airtel_number, alternate_number, email, preferred_package, installation_town, delivery_landmark, visit_date, visit_time, agent_type, enterprise_cp, agent_name, agent_mobile, lead_type, connection_type, created_at, bypass_duplicate_check, resubmitted"
+          )
+          .order("created_at", { ascending: false })
+          .limit(200), // Limit to 200 most recent leads for faster loading
+      ]);
 
-      if (yesterdayError) {
-        console.error("Error fetching yesterday's count:", {
-          error: yesterdayError,
-          message: yesterdayError.message,
-          details: yesterdayError.details,
-          hint: yesterdayError.hint,
-          code: yesterdayError.code,
-        });
+      // Handle count results
+      if (totalResult.error) {
+        handleSupabaseError(totalResult.error);
+        console.error("Error fetching total count:", totalResult.error);
+        setTotalCount(0);
+      } else {
+        setTotalCount(totalResult.count || 0);
+      }
+
+      if (todayResult.error) {
+        handleSupabaseError(todayResult.error);
+        console.error("Error fetching today's count:", todayResult.error);
+        setTodayCount(0);
+      } else {
+        setTodayCount(todayResult.count || 0);
+      }
+
+      if (yesterdayResult.error) {
+        handleSupabaseError(yesterdayResult.error);
+        console.error("Error fetching yesterday's count:", yesterdayResult.error);
         setYesterdayCount(0);
       } else {
-        setYesterdayCount(yesterdayCount || 0);
+        setYesterdayCount(yesterdayResult.count || 0);
       }
 
-      // Fetch leads data with all fields needed for duplicate detection
-      const { data: leadsData, error: leadsError } = await supabase
-        .from("leads")
-        .select(
-          "id, customer_name, airtel_number, alternate_number, email, preferred_package, installation_town, delivery_landmark, visit_date, visit_time, agent_type, enterprise_cp, agent_name, agent_mobile, lead_type, connection_type, created_at"
-        )
-        .order("created_at", { ascending: false });
-
-      if (leadsError) {
-        console.error("Error fetching leads:", {
-          error: leadsError,
-          message: leadsError.message,
-          details: leadsError.details,
-          hint: leadsError.hint,
-          code: leadsError.code,
-        });
+      // Handle leads data
+      if (leadsResult.error) {
+        handleSupabaseError(leadsResult.error);
+        console.error("Error fetching leads:", leadsResult.error);
         setLeads([]);
       } else {
-        setLeads(leadsData || []);
+        setLeads(leadsResult.data || []);
       }
+
+      // Fetch daily registration data for graph (based on selected range)
+      // Use the current graphDateRange state value
+      await fetchGraphData(graphDateRange);
     } catch (error) {
       console.error("Unexpected error in fetchCounts:", {
         error,
@@ -467,9 +631,134 @@ export default function HomeScreen() {
     currentLead: Lead,
     allLeads: Lead[]
   ): "red" | "orange" | null => {
+    // Skip duplicate checking if this lead has bypass_duplicate_check flag
+    if (currentLead.bypass_duplicate_check === true) {
+      return null;
+    }
+
     for (const otherLead of allLeads) {
       // Skip comparing with itself
       if (currentLead.id === otherLead.id) continue;
+
+      // Skip comparing with leads that have bypass_duplicate_check flag
+      if (otherLead.bypass_duplicate_check === true) continue;
+
+      // Check 1: All details match (excluding timestamps) → RED
+      if (allDetailsMatch(currentLead, otherLead)) {
+        return "red";
+      }
+
+      // Check 2: Both phone numbers + email match → RED
+      if (
+        currentLead.airtel_number === otherLead.airtel_number &&
+        currentLead.alternate_number === otherLead.alternate_number &&
+        currentLead.email &&
+        currentLead.email === otherLead.email
+      ) {
+        return "red";
+      }
+
+      // Check 3: Different name but both phone numbers match → ORANGE
+      if (
+        currentLead.customer_name !== otherLead.customer_name &&
+        currentLead.airtel_number === otherLead.airtel_number &&
+        currentLead.alternate_number === otherLead.alternate_number
+      ) {
+        return "orange";
+      }
+
+      // Check 4: Only email matches → ORANGE
+      if (
+        currentLead.email &&
+        currentLead.email === otherLead.email &&
+        (currentLead.airtel_number !== otherLead.airtel_number ||
+          currentLead.alternate_number !== otherLead.alternate_number ||
+          currentLead.customer_name !== otherLead.customer_name)
+      ) {
+        return "orange";
+      }
+
+      // Check 5: Same customer_name + same airtel_number → RED
+      if (
+        currentLead.customer_name === otherLead.customer_name &&
+        currentLead.airtel_number === otherLead.airtel_number
+      ) {
+        return "red";
+      }
+
+      // Check 6: Similar customer names (case-insensitive) with at least one phone number matches → RED
+      if (
+        areNamesSimilar(currentLead.customer_name, otherLead.customer_name) &&
+        (currentLead.airtel_number === otherLead.airtel_number ||
+          currentLead.alternate_number === otherLead.alternate_number)
+      ) {
+        return "red";
+      }
+
+      // Check 7: Same airtel_number OR same alternate_number (just one number matches) → ORANGE
+      if (
+        (currentLead.airtel_number === otherLead.airtel_number &&
+          currentLead.alternate_number !== otherLead.alternate_number) ||
+        (currentLead.alternate_number === otherLead.alternate_number &&
+          currentLead.airtel_number !== otherLead.airtel_number)
+      ) {
+        return "orange";
+      }
+    }
+
+    return null;
+  };
+
+  // Optimized duplicate check using pre-built indexes
+  const checkDuplicateStatusOptimized = (
+    currentLead: Lead,
+    allLeads: Lead[],
+    phoneMap: Map<string, Lead[]>,
+    emailMap: Map<string, Lead[]>,
+    nameMap: Map<string, Lead[]>
+  ): "red" | "orange" | null => {
+    // Skip duplicate checking if this lead has bypass_duplicate_check flag
+    if (currentLead.bypass_duplicate_check === true) {
+      return null;
+    }
+
+    // Get potential matches from indexes (much faster than iterating all leads)
+    const potentialMatches = new Set<Lead>();
+    
+    // Add leads with matching phone numbers
+    if (currentLead.airtel_number) {
+      const key = currentLead.airtel_number.trim().toLowerCase();
+      phoneMap.get(key)?.forEach(lead => {
+        if (lead.id !== currentLead.id) potentialMatches.add(lead);
+      });
+    }
+    if (currentLead.alternate_number) {
+      const key = currentLead.alternate_number.trim().toLowerCase();
+      phoneMap.get(key)?.forEach(lead => {
+        if (lead.id !== currentLead.id) potentialMatches.add(lead);
+      });
+    }
+    
+    // Add leads with matching email
+    if (currentLead.email) {
+      const key = currentLead.email.trim().toLowerCase();
+      emailMap.get(key)?.forEach(lead => {
+        if (lead.id !== currentLead.id) potentialMatches.add(lead);
+      });
+    }
+    
+    // Add leads with matching or similar names
+    if (currentLead.customer_name) {
+      const key = currentLead.customer_name.trim().toLowerCase();
+      nameMap.get(key)?.forEach(lead => {
+        if (lead.id !== currentLead.id) potentialMatches.add(lead);
+      });
+    }
+
+    // Now check only potential matches (much smaller set)
+    for (const otherLead of potentialMatches) {
+      // Skip comparing with leads that have bypass_duplicate_check flag
+      if (otherLead.bypass_duplicate_check === true) continue;
 
       // Check 1: All details match (excluding timestamps) → RED
       if (allDetailsMatch(currentLead, otherLead)) {
@@ -574,21 +863,78 @@ export default function HomeScreen() {
     return groups;
   };
 
-  // Calculate duplicate status for all leads
+  // Calculate duplicate status for all leads (optimized and non-blocking)
   useEffect(() => {
-    if (leads.length > 0) {
-      const status: { [key: string]: "red" | "orange" | null } = {};
-      leads.forEach((lead) => {
-        status[lead.id] = checkDuplicateStatus(lead, leads);
+    if (leads.length === 0) {
+      setDuplicateCount(0);
+      setTodayDuplicateCount(0);
+      setDuplicateStatus({});
+      return;
+    }
+
+    // Initialize all as null first (non-blocking)
+    const initialStatus: { [key: string]: "red" | "orange" | null } = {};
+    leads.forEach((lead) => {
+      initialStatus[lead.id] = null;
+    });
+    setDuplicateStatus(initialStatus);
+
+    // Defer heavy computation to avoid blocking UI
+    const timeoutId = setTimeout(() => {
+      // Only check first 200 leads for duplicates (most recent ones)
+      // This dramatically improves performance while still catching most duplicates
+      const leadsToProcess = leads.slice(0, 200);
+      
+      // Build lookup maps for faster duplicate detection
+      const phoneMap = new Map<string, Lead[]>();
+      const emailMap = new Map<string, Lead[]>();
+      const nameMap = new Map<string, Lead[]>();
+      
+      // Filter out bypassed leads for faster processing
+      const leadsToCheck = leadsToProcess.filter(lead => lead.bypass_duplicate_check !== true);
+      
+      // Build indexes only for leads we're checking
+      leadsToCheck.forEach((lead) => {
+        // Index by phone numbers
+        if (lead.airtel_number) {
+          const key = lead.airtel_number.trim().toLowerCase();
+          if (!phoneMap.has(key)) phoneMap.set(key, []);
+          phoneMap.get(key)!.push(lead);
+        }
+        if (lead.alternate_number) {
+          const key = lead.alternate_number.trim().toLowerCase();
+          if (!phoneMap.has(key)) phoneMap.set(key, []);
+          phoneMap.get(key)!.push(lead);
+        }
+        
+        // Index by email
+        if (lead.email) {
+          const key = lead.email.trim().toLowerCase();
+          if (!emailMap.has(key)) emailMap.set(key, []);
+          emailMap.get(key)!.push(lead);
+        }
+        
+        // Index by name
+        if (lead.customer_name) {
+          const key = lead.customer_name.trim().toLowerCase();
+          if (!nameMap.has(key)) nameMap.set(key, []);
+          nameMap.get(key)!.push(lead);
+        }
       });
+
+      const status: { [key: string]: "red" | "orange" | null } = { ...initialStatus };
+      
+      // Only check leads that aren't bypassed (limited to first 200)
+      leadsToCheck.forEach((lead) => {
+        status[lead.id] = checkDuplicateStatusOptimized(lead, leadsToCheck, phoneMap, emailMap, nameMap);
+      });
+      
       setDuplicateStatus(status);
 
       // Count unique duplicate groups (only count extras, not all duplicates)
-      const duplicateGroups = groupDuplicates(leads);
+      const duplicateGroups = groupDuplicates(leadsToCheck);
       let totalExtras = 0;
       duplicateGroups.forEach((group) => {
-        // For each group, count (group size - 1) as extras
-        // e.g., if 2 identical records, count 1 extra; if 3 identical, count 2 extras
         totalExtras += group.length - 1;
       });
       setDuplicateCount(totalExtras);
@@ -600,7 +946,7 @@ export default function HomeScreen() {
 
       duplicateGroups.forEach((group) => {
         const groupLeads = group
-          .map((id) => leads.find((l) => l.id === id))
+          .map((id) => leadsToCheck.find((l) => l.id === id))
           .filter(Boolean) as Lead[];
         const todayLeadsInGroup = groupLeads.filter((lead) => {
           const leadDate = new Date(lead.created_at);
@@ -609,21 +955,18 @@ export default function HomeScreen() {
         });
 
         if (todayLeadsInGroup.length > 0) {
-          // If multiple today's leads in same duplicate group, count extras
           if (todayLeadsInGroup.length > 1) {
             todayExtras += todayLeadsInGroup.length - 1;
           } else if (groupLeads.length > 1) {
-            // One today's lead is duplicate of older lead(s) - count it
             todayExtras += 1;
           }
         }
       });
 
       setTodayDuplicateCount(todayExtras);
-    } else {
-      setDuplicateCount(0);
-      setTodayDuplicateCount(0);
-    }
+    }, 300); // Increased delay to let UI render first
+
+    return () => clearTimeout(timeoutId);
   }, [leads]);
 
   // Format phone number: remove 254 prefix and show as 07 or 01
@@ -1153,7 +1496,23 @@ export default function HomeScreen() {
         </View>
       </View>
 
-      {/* Main Content */}
+      {/* Main Content - Scrollable */}
+      <ScrollView
+        style={styles.scrollContent}
+        showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={async () => {
+              setRefreshing(true);
+              await fetchCounts(false);
+              setRefreshing(false);
+            }}
+            tintColor="#FFD700"
+            colors={["#FFD700"]}
+          />
+        }
+      >
       <View style={styles.statsRow}>
         {/* Left: Registered Today */}
         <View style={styles.statItem}>
@@ -1226,24 +1585,177 @@ export default function HomeScreen() {
         </View>
       </View>
 
+      {/* Graph Section */}
+      <View style={styles.graphContainer}>
+        {/* Date Range Filters */}
+        <View style={styles.graphHeader}>
+          <View style={styles.graphTitleContainer}>
+            <Text style={styles.graphTitle}>Registrations</Text>
+          </View>
+          <View style={styles.dateRangeButtons}>
+            <TouchableOpacity
+              style={[styles.dateRangeButton, graphDateRange === "7d" && styles.dateRangeButtonActive, graphLoading && styles.dateRangeButtonDisabled]}
+              onPress={async () => {
+                if (graphDateRange === "7d" || graphLoading) return;
+                setGraphLoading(true);
+                setGraphDateRange("7d");
+                await fetchGraphData("7d");
+                setGraphLoading(false);
+              }}
+              disabled={graphLoading}
+            >
+              <Text style={[styles.dateRangeButtonText, graphDateRange === "7d" && styles.dateRangeButtonTextActive]}>
+                7d
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.dateRangeButton,
+                graphDateRange === "30d" && styles.dateRangeButtonActive,
+                graphLoading && styles.dateRangeButtonDisabled,
+              ]}
+              onPress={async () => {
+                if (graphDateRange === "30d" || graphLoading) return;
+                setGraphLoading(true);
+                setGraphDateRange("30d");
+                await fetchGraphData("30d");
+                setGraphLoading(false);
+              }}
+              disabled={graphLoading}
+            >
+              <Text style={[styles.dateRangeButtonText, graphDateRange === "30d" && styles.dateRangeButtonTextActive]}>
+                30d
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.dateRangeButton,
+                graphDateRange === "90d" && styles.dateRangeButtonActive,
+                graphLoading && styles.dateRangeButtonDisabled,
+              ]}
+              onPress={async () => {
+                if (graphDateRange === "90d" || graphLoading) return;
+                setGraphLoading(true);
+                setGraphDateRange("90d");
+                await fetchGraphData("90d");
+                setGraphLoading(false);
+              }}
+              disabled={graphLoading}
+            >
+              <Text style={[styles.dateRangeButtonText, graphDateRange === "90d" && styles.dateRangeButtonTextActive]}>
+                90d
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+        
+        <View style={styles.graph}>
+          {dailyData.length > 0 ? (
+            <View style={styles.chartArea}>
+              <View style={[styles.chartWrapper, { width: Dimensions.get("window").width - 40 }]}>
+                <LineChart
+                    data={{
+                      labels: dailyData.map((day, index) => {
+                        const date = new Date(day.date);
+                        if (graphDateRange === "7d") {
+                          return ["S", "M", "T", "W", "T", "F", "S"][date.getDay()];
+                        } else if (graphDateRange === "30d") {
+                          // Show every 5th label to avoid crowding (7 labels total)
+                          if (index % 5 === 0 || index === dailyData.length - 1) {
+                            return `${date.getMonth() + 1}/${date.getDate()}`;
+                          }
+                          return "";
+                        } else {
+                          // 90d - show every other week label (7 labels total)
+                          if (index % 2 === 0 || index === dailyData.length - 1) {
+                            return `${date.getMonth() + 1}/${date.getDate()}`;
+                          }
+                          return "";
+                        }
+                      }),
+                      datasets: [
+                        {
+                          data: dailyData.map((day) => day.count),
+                          color: (opacity = 1) => `rgba(255, 215, 0, 1)`, // Bright gold color (full opacity)
+                          strokeWidth: 1,
+                        },
+                      ],
+                    }}
+                  width={Dimensions.get("window").width - 40} // Container width (20px margin each side)
+                  height={220}
+                  chartConfig={{
+                    backgroundColor: "#1A1A1A",
+                    backgroundGradientFrom: "#1A1A1A",
+                    backgroundGradientTo: "#1A1A1A",
+                    decimalPlaces: 0,
+                    color: (opacity = 1) => `rgba(255, 215, 0, 1)`, // Bright gold (full opacity)
+                    labelColor: (opacity = 1) => `rgba(255, 255, 255, ${opacity})`,
+                    style: {
+                      borderRadius: 12,
+                    },
+                    propsForBackgroundLines: {
+                      strokeDasharray: "", // solid lines
+                      stroke: "#2A2A2A",
+                      strokeWidth: 1,
+                    },
+                    propsForLabels: {
+                      dx: 0.5, // Add left padding to Y-axis labels
+                    },
+                  }}
+                  bezier // Smooth curves
+                  style={{
+                    marginVertical: 8,
+                    marginLeft: 8, // Add left padding to the chart
+                    borderRadius: 12,
+                  }}
+                  withInnerLines={true}
+                  withOuterLines={false}
+                  withVerticalLines={false}
+                  withHorizontalLines={true}
+                  withDots={false}
+                  withShadow={false}
+                  segments={4}
+                  yAxisLabel=""
+                  yAxisSuffix=""
+                  yAxisInterval={1}
+                  fromZero={false}
+                  formatYLabel={(value) => {
+                    const num = parseInt(value);
+                    return num.toString();
+                  }}
+                  />
+              </View>
+            </View>
+          ) : (
+            <View style={styles.graphEmpty}>
+              <Text style={styles.graphEmptyText}>No data available</Text>
+            </View>
+          )}
+          {/* Loading bar overlay */}
+          {graphLoading && (
+            <View style={styles.graphLoadingOverlay}>
+              <View style={styles.loadingBarContainer}>
+                <Animated.View
+                  style={[
+                    {
+                      height: "100%",
+                      backgroundColor: "#FFD700",
+                      borderRadius: 1.5,
+                      width: loadingBarAnimation.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: ["0%", "100%"],
+                      }),
+                    },
+                  ]}
+                />
+              </View>
+            </View>
+          )}
+        </View>
+      </View>
+
       {/* Customers Data Section */}
       <View style={styles.customersSection}>
-        <ScrollView
-          style={styles.customersList}
-          showsVerticalScrollIndicator={false}
-          refreshControl={
-            <RefreshControl
-              refreshing={refreshing}
-              onRefresh={async () => {
-                setRefreshing(true);
-                await fetchCounts(false);
-                setRefreshing(false);
-              }}
-              tintColor="#FFD700"
-              colors={["#FFD700"]}
-            />
-          }
-        >
           {/* Table Rows */}
           {loading ? (
             <View style={styles.emptyState}>
@@ -1282,24 +1794,36 @@ export default function HomeScreen() {
                       const duplicateColor = duplicateStatus[lead.id];
                       const isRed = duplicateColor === "red";
                       const isOrange = duplicateColor === "orange";
+                      const isResubmitted = lead.resubmitted === true;
 
                       return (
                         <View key={lead.id} style={styles.tableRow}>
                           <Text style={styles.cellNumber}>{globalIndex}</Text>
-                          <Text
-                            style={[
-                              styles.cellName,
-                              isTodayLead &&
-                                !isRed &&
-                                !isOrange &&
-                                styles.cellNameToday,
-                              isRed && styles.cellNameRed,
-                              isOrange && styles.cellNameOrange,
-                            ]}
-                            numberOfLines={1}
-                          >
-                            {formatName(lead.customer_name)}
-                          </Text>
+                          <View style={styles.cellNameContainer}>
+                            <Text
+                              style={[
+                                styles.cellName,
+                                isTodayLead &&
+                                  !isRed &&
+                                  !isOrange &&
+                                  !isResubmitted &&
+                                  styles.cellNameToday,
+                                isRed && !isResubmitted && styles.cellNameRed,
+                                isOrange && !isResubmitted && styles.cellNameOrange,
+                                isResubmitted && styles.cellNameResubmitted,
+                              ]}
+                              numberOfLines={1}
+                            >
+                              {formatName(lead.customer_name)}
+                            </Text>
+                            {isResubmitted && (
+                              <View style={styles.resubmitBadge}>
+                                <Text style={styles.resubmitBadgeText}>
+                                  RESUBMIT
+                                </Text>
+                              </View>
+                            )}
+                          </View>
                           <View style={styles.cellNumbers}>
                             <TouchableOpacity
                               onPress={() =>
@@ -1352,7 +1876,6 @@ export default function HomeScreen() {
               });
             })()
           )}
-        </ScrollView>
       </View>
 
       {/* Filter Modal */}
@@ -1610,6 +2133,7 @@ export default function HomeScreen() {
           </View>
         </TouchableOpacity>
       </Modal>
+      </ScrollView>
     </SafeAreaView>
   );
 }
@@ -1787,12 +2311,20 @@ const styles = StyleSheet.create({
     flexShrink: 0,
     flexGrow: 0,
   },
+  cellNameContainer: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    marginRight: 16,
+    flexShrink: 1,
+    minWidth: 0,
+    gap: 8,
+  },
   cellName: {
     flex: 1,
     fontSize: 14,
     fontFamily: "Inter_400Regular",
     color: "#FFD700", // Golden color for name
-    marginRight: 16,
     textAlign: "left",
     flexShrink: 1,
     minWidth: 0,
@@ -1805,6 +2337,22 @@ const styles = StyleSheet.create({
   },
   cellNameOrange: {
     color: "#FB923C", // Orange color for potential duplicates
+  },
+  cellNameResubmitted: {
+    color: "#8B5CF6", // Purple color for resubmitted customers
+  },
+  resubmitBadge: {
+    backgroundColor: "#8B5CF6",
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    flexShrink: 0,
+  },
+  resubmitBadgeText: {
+    fontSize: 10,
+    fontFamily: "Inter_600SemiBold",
+    color: "#FFFFFF",
+    letterSpacing: 0.5,
   },
   dateSeparator: {
     flexDirection: "row",
@@ -2070,5 +2618,242 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontFamily: "Inter_600SemiBold",
     color: "#FFD700",
+  },
+  graphContainer: {
+    marginTop: 30,
+    marginHorizontal: 20,
+    paddingVertical: 20,
+    paddingHorizontal: 16,
+    backgroundColor: "#1A1A1A",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#2A2A2A",
+  },
+  graphTitleContainer: {
+    flex: 1,
+    marginRight: 12,
+  },
+  graphTitle: {
+    fontSize: 16,
+    fontFamily: "Inter_600SemiBold",
+    color: "#FFFFFF",
+  },
+  graph: {
+    flexDirection: "row",
+    height: 200,
+    alignItems: "flex-end",
+  },
+  yAxis: {
+    width: 30,
+    justifyContent: "space-between",
+    paddingRight: 8,
+    marginBottom: 30,
+  },
+  yAxisLabel: {
+    fontSize: 10,
+    fontFamily: "Inter_400Regular",
+    color: "#888888",
+    textAlign: "right",
+  },
+  chartArea: {
+    width: "100%",
+    overflow: "hidden",
+    alignItems: "center",
+  },
+  chartWrapper: {
+    marginLeft: -40, // Hide right Y-axis by shifting left
+  },
+  barContainer: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "flex-end",
+    height: "100%",
+  },
+  barWrapper: {
+    width: "80%",
+    height: "100%",
+    justifyContent: "flex-end",
+    alignItems: "center",
+  },
+  bar: {
+    width: "100%",
+    backgroundColor: "#FFD700",
+    borderRadius: 4,
+    minHeight: 4,
+    justifyContent: "flex-start",
+    alignItems: "center",
+    paddingTop: 4,
+  },
+  barToday: {
+    backgroundColor: "#10B981",
+  },
+  barValue: {
+    fontSize: 10,
+    fontFamily: "Inter_600SemiBold",
+    color: "#000000",
+  },
+  barLabel: {
+    fontSize: 11,
+    fontFamily: "Inter_400Regular",
+    color: "#888888",
+    marginTop: 8,
+  },
+  barLabelToday: {
+    color: "#10B981",
+    fontFamily: "Inter_600SemiBold",
+  },
+  barDate: {
+    fontSize: 10,
+    fontFamily: "Inter_400Regular",
+    color: "#666666",
+    marginTop: 2,
+  },
+  barDateToday: {
+    color: "#10B981",
+    fontFamily: "Inter_600SemiBold",
+  },
+  graphEmpty: {
+    height: 220, // Match chart height
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  graphEmptyText: {
+    fontSize: 14,
+    color: "#888888",
+    fontFamily: "Inter_400Regular",
+  },
+  graphLoadingOverlay: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: "rgba(26, 26, 26, 0.7)",
+    justifyContent: "flex-start",
+    alignItems: "center",
+    borderRadius: 12,
+  },
+  loadingBarContainer: {
+    width: "100%",
+    height: 3,
+    backgroundColor: "#2A2A2A",
+    overflow: "hidden",
+    borderRadius: 1.5,
+  },
+  scrollContent: {
+    flex: 1,
+  },
+  graphHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 20,
+    paddingBottom: 8,
+  },
+  dateRangeButtons: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  dateRangeButton: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+    backgroundColor: "#2A2A2A",
+    borderWidth: 1,
+    borderColor: "#3A3A3A",
+    minWidth: 44,
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: 6,
+  },
+  dateRangeButtonActive: {
+    backgroundColor: "#FFD700",
+    borderColor: "#FFD700",
+  },
+  dateRangeButtonText: {
+    fontSize: 13,
+    fontFamily: "Inter_600SemiBold",
+    color: "#888888",
+    textAlign: "center",
+  },
+  dateRangeButtonTextActive: {
+    color: "#000000",
+    fontFamily: "Inter_700Bold",
+  },
+  dateRangeButtonDisabled: {
+    opacity: 0.5,
+  },
+  lineChartContainer: {
+    flex: 1,
+    position: "relative",
+    height: "100%",
+  },
+  gridLine: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    height: 1,
+    backgroundColor: "#2A2A2A",
+  },
+  linePath: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 30,
+  },
+  lineSegment: {
+    position: "absolute",
+    backgroundColor: "#FFD700",
+    borderRadius: 1.5,
+    transformOrigin: "left center",
+  },
+  dataPointContainer: {
+    position: "absolute",
+    alignItems: "center",
+    justifyContent: "center",
+    marginLeft: -12,
+    marginBottom: -12,
+  },
+  dataPointDot: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: "#FFD700",
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 3,
+    borderColor: "#0A0A0A",
+    shadowColor: "#FFD700",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.5,
+    shadowRadius: 4,
+    elevation: 4,
+  },
+  dataPointDotToday: {
+    backgroundColor: "#10B981",
+    borderColor: "#0A0A0A",
+    shadowColor: "#10B981",
+  },
+  dataPointValue: {
+    fontSize: 9,
+    fontFamily: "Inter_700Bold",
+    color: "#000000",
+  },
+  xAxis: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    paddingTop: 8,
+    height: 30,
+  },
+  xAxisLabel: {
+    fontSize: 10,
+    fontFamily: "Inter_400Regular",
+    color: "#888888",
+    textAlign: "center",
+  },
+  xAxisLabelToday: {
+    color: "#10B981",
+    fontFamily: "Inter_600SemiBold",
   },
 });

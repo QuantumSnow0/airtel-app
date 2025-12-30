@@ -56,7 +56,9 @@
       "router": {},
       "eas": {
         "projectId": "7603a739-48d3-4620-adfb-52b131c727bf"
-      }
+      },
+      "supabaseUrl": "https://mcpfqnccbszswlcxpcbq.supabase.co",
+      "supabaseAnonKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1jcGZxbmNjYnN6c3dsY3hwY2JxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjM3Mzg3NjQsImV4cCI6MjA3OTMxNDc2NH0.P6JRi2PQAR45EmrKC0iu0IcoIwfdL32f1sm9o2h-JeQ"
     },
     "runtimeVersion": {
       "policy": "appVersion"

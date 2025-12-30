@@ -2,7 +2,7 @@ import { Ionicons } from "@expo/vector-icons";
 import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import { useNavigation } from "expo-router";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -96,7 +96,7 @@ type FilterType =
 export default function MessagesScreen() {
   const insets = useSafeAreaInsets();
   const navigation = useNavigation();
-  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [allConversations, setAllConversations] = useState<Conversation[]>([]); // Store all loaded conversations
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -334,60 +334,17 @@ export default function MessagesScreen() {
       if (showLoadingState) setLoading(true);
       const supabase = getSupabaseClient();
 
-      // Fetch all customers/leads
+      // Fetch customers/leads (limit to 500 for performance, exclude resubmitted)
       let customersQuery = supabase
         .from("leads")
         .select(
           "id, customer_name, installation_town, airtel_number, alternate_number, preferred_package, whatsapp_response, whatsapp_response_date, whatsapp_message_sent_date, created_at, status, source, is_pinned"
-        );
+        )
+        .neq("resubmitted", true) // Exclude resubmitted customers
+        .limit(500); // Limit to 500 most recent for performance
 
-      // Apply search filter
-      if (searchQuery.trim()) {
-        // Generate phone number search patterns for different formats
-        const getPhoneSearchPatterns = (searchQuery: string): string[] => {
-          const digits = searchQuery.replace(/\D/g, "");
-          if (digits.length === 0) return [];
-
-          const patterns: string[] = [];
-
-          if (digits.startsWith("0")) {
-            patterns.push(digits);
-            patterns.push("254" + digits.substring(1));
-            patterns.push(digits.substring(1));
-          } else if (digits.startsWith("254")) {
-            patterns.push(digits);
-            patterns.push("0" + digits.substring(3));
-            patterns.push(digits.substring(3));
-          } else {
-            patterns.push(digits);
-            patterns.push("0" + digits);
-            patterns.push("254" + digits);
-          }
-
-          return [...new Set(patterns)];
-        };
-
-        const phonePatterns = getPhoneSearchPatterns(searchQuery);
-
-        // Build search conditions
-        let searchConditions = `customer_name.ilike.%${searchQuery}%,installation_town.ilike.%${searchQuery}%`;
-
-        // Add phone number search patterns
-        if (phonePatterns.length > 0) {
-          const airtelConditions = phonePatterns
-            .map((p) => `airtel_number.ilike.%${p}%`)
-            .join(",");
-          const alternateConditions = phonePatterns
-            .map((p) => `alternate_number.ilike.%${p}%`)
-            .join(",");
-          searchConditions += `,${airtelConditions},${alternateConditions}`;
-        } else {
-          // Fallback: search as-is if no phone patterns
-          searchConditions += `,airtel_number.ilike.%${searchQuery}%,alternate_number.ilike.%${searchQuery}%`;
-        }
-
-        customersQuery = customersQuery.or(searchConditions);
-      }
+      // Search filtering is now done client-side for instant results
+      // No need to apply search filter to database query
 
       // Apply status filter
       if (filter === "yes") {
@@ -433,15 +390,15 @@ export default function MessagesScreen() {
       
       if (customersError) {
         console.error("Error fetching customers:", customersError);
-        setConversations([]);
+        setAllConversations([]);
         if (showLoadingState) setLoading(false);
         return;
       }
       
       const customers = fetchedCustomers || [];
 
-      // Optimize: Fetch all messages for all customers in one query
-      const customerIds = (customers || []).map((c) => c.id);
+      // Optimize: Fetch messages more efficiently
+      // Only fetch what we need for conversation list (last message + unread count)
       const phoneNumbers = (customers || [])
         .map((c) => {
           const phone = c.alternate_number || c.airtel_number;
@@ -449,28 +406,38 @@ export default function MessagesScreen() {
         })
         .filter((p): p is string => p !== null);
 
-      // Get all messages for these customers in one query
-      const { data: allMessages } = await supabase
-        .from("whatsapp_messages")
-        .select("*")
-        .in("customer_phone", phoneNumbers)
-        .order("created_at", { ascending: false });
-
-      // Group messages by customer phone
       const messagesByPhone = new Map<string, WhatsAppMessage[]>();
-      (allMessages || []).forEach((msg) => {
-        const existing = messagesByPhone.get(msg.customer_phone) || [];
-        existing.push(msg);
-        messagesByPhone.set(msg.customer_phone, existing);
-      });
+      
+      if (phoneNumbers.length > 0) {
+        // Strategy: Fetch recent messages (last 300) and group by phone
+        // This is much faster than fetching all messages for all customers
+        const { data: recentMessages } = await supabase
+          .from("whatsapp_messages")
+          .select("*")
+          .in("customer_phone", phoneNumbers)
+          .order("created_at", { ascending: false })
+          .limit(300); // Only fetch 300 most recent messages across all customers
+
+        // Group messages by phone (keep up to 5 most recent per customer for unread count)
+        (recentMessages || []).forEach((msg) => {
+          const existing = messagesByPhone.get(msg.customer_phone) || [];
+          if (existing.length < 5) { // Keep only last 5 messages per customer
+            existing.push(msg);
+            messagesByPhone.set(msg.customer_phone, existing);
+          }
+        });
+      }
 
       // If filtering by needs_review, get phone numbers with flagged messages
       let flaggedPhoneNumbers: Set<string> = new Set();
       if (filter === "needs_review") {
-        (allMessages || []).forEach((msg) => {
-          if (msg.needs_agent_review === true) {
-            flaggedPhoneNumbers.add(msg.customer_phone);
-          }
+        // Check messages we already fetched
+        messagesByPhone.forEach((messages) => {
+          messages.forEach((msg) => {
+            if (msg.needs_agent_review === true) {
+              flaggedPhoneNumbers.add(msg.customer_phone);
+            }
+          });
         });
       }
 
@@ -488,7 +455,7 @@ export default function MessagesScreen() {
 
       // If needs_review filter and no matches, return empty
       if (filter === "needs_review" && customersToUse.length === 0) {
-        setConversations([]);
+        setAllConversations([]);
         if (showLoadingState) setLoading(false);
         return;
       }
@@ -565,10 +532,10 @@ export default function MessagesScreen() {
         );
       });
 
-      setConversations(conversationsWithMessages);
+      setAllConversations(conversationsWithMessages);
     } catch (error) {
       console.error("Error:", error);
-      setConversations([]);
+      setAllConversations([]);
     } finally {
       if (showLoadingState) {
         setLoading(false);
@@ -620,31 +587,87 @@ export default function MessagesScreen() {
     };
   }, [isSupabaseConfigured, selectedCustomer]);
 
-  // Fetch conversations on mount and when filters change (with debounce)
+  // Filter conversations client-side based on search query (instant, no database query)
+  const filteredConversations = useMemo(() => {
+    let result = allConversations;
+
+    // Apply search filter client-side (instant)
+    if (searchQuery.trim()) {
+      const query = searchQuery.toLowerCase().trim();
+      
+      // Generate phone number search patterns
+      const getPhoneSearchPatterns = (searchQuery: string): string[] => {
+        const digits = searchQuery.replace(/\D/g, "");
+        if (digits.length === 0) return [];
+
+        const patterns: string[] = [];
+        if (digits.startsWith("0")) {
+          patterns.push(digits);
+          patterns.push("254" + digits.substring(1));
+          patterns.push(digits.substring(1));
+        } else if (digits.startsWith("254")) {
+          patterns.push(digits);
+          patterns.push("0" + digits.substring(3));
+          patterns.push(digits.substring(3));
+        } else {
+          patterns.push(digits);
+          patterns.push("0" + digits);
+          patterns.push("254" + digits);
+        }
+        return [...new Set(patterns)];
+      };
+
+      const phonePatterns = getPhoneSearchPatterns(searchQuery);
+
+      result = result.filter((conv) => {
+        const customer = conv.customer;
+        
+        // Search in customer name
+        if (customer.customer_name?.toLowerCase().includes(query)) {
+          return true;
+        }
+
+        // Search in installation town
+        if (customer.installation_town?.toLowerCase().includes(query)) {
+          return true;
+        }
+
+        // Search in phone numbers
+        const airtelNumber = customer.airtel_number?.toLowerCase() || "";
+        const alternateNumber = customer.alternate_number?.toLowerCase() || "";
+
+        if (phonePatterns.length > 0) {
+          return phonePatterns.some(
+            (pattern) =>
+              airtelNumber.includes(pattern.toLowerCase()) ||
+              alternateNumber.includes(pattern.toLowerCase())
+          );
+        } else {
+          return airtelNumber.includes(query) || alternateNumber.includes(query);
+        }
+      });
+    }
+
+    return result;
+  }, [allConversations, searchQuery]);
+
+  // Only refetch from database when filter changes (not search)
   useEffect(() => {
     if (!isSupabaseConfigured) return;
 
-    // Show search indicator if there's a search query
-    if (searchQuery.trim()) {
-      setSearching(true);
-      setLoading(true);
-    } else {
-      setLoading(true);
-      setSearching(false);
-    }
-
+    setLoading(true);
+    
     // Debounce the actual fetch
     const timer = setTimeout(() => {
       fetchConversations(true).finally(() => {
-        setSearching(false);
+        setLoading(false);
       });
-    }, 400); // 400ms debounce for better UX
+    }, 300); // Reduced debounce since search is now client-side
 
     return () => {
       clearTimeout(timer);
-      setSearching(false);
     };
-  }, [searchQuery, filter, isSupabaseConfigured]);
+  }, [filter, isSupabaseConfigured]); // Removed searchQuery - now filtered client-side
 
   // Handle Android back button when in chat view
   useEffect(() => {
@@ -837,12 +860,12 @@ export default function MessagesScreen() {
 
   // Select all / Deselect all
   const handleSelectAll = () => {
-    if (selectedIds.size === conversations.length) {
+    if (selectedIds.size === filteredConversations.length) {
       // Deselect all
       setSelectedIds(new Set());
     } else {
       // Select all
-      setSelectedIds(new Set(conversations.map((c) => c.customer.id)));
+      setSelectedIds(new Set(filteredConversations.map((c) => c.customer.id)));
     }
   };
 
@@ -1521,7 +1544,7 @@ export default function MessagesScreen() {
                 style={styles.headerButton}
               >
                 <Text style={styles.headerButtonText}>
-                  {selectedIds.size === conversations.length
+                  {selectedIds.size === filteredConversations.length
                     ? "Deselect All"
                     : "Select All"}
                 </Text>
@@ -1647,12 +1670,12 @@ export default function MessagesScreen() {
           />
         }
       >
-        {loading && conversations.length === 0 ? (
+        {loading && allConversations.length === 0 ? (
           <View style={styles.loadingContainer}>
             <ActivityIndicator size="large" color="#FFD700" />
             <Text style={styles.loadingText}>Loading conversations...</Text>
           </View>
-        ) : conversations.length === 0 ? (
+        ) : filteredConversations.length === 0 ? (
           <View style={styles.emptyContainer}>
             <Ionicons name="chatbubbles-outline" size={64} color="#4B5563" />
             <Text style={styles.emptyText}>No conversations</Text>
@@ -1663,7 +1686,7 @@ export default function MessagesScreen() {
             </Text>
           </View>
         ) : (
-          conversations.map((conversation) => {
+          filteredConversations.map((conversation) => {
             const isSelected = selectedIds.has(conversation.customer.id);
             const statusBadge = getStatusBadge(conversation.customer);
             const phoneNumber =

@@ -12,7 +12,6 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { dataPreloader } from "../lib/dataPreloader";
 import { markTutorialCompleted } from "../lib/tutorial";
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get("window");
@@ -178,13 +177,6 @@ export default function OnboardingScreen() {
   const fadeAnim = useRef(new Animated.Value(1)).current;
   const isGoingBackRef = useRef(false);
 
-  useEffect(() => {
-    // Continue preloading data during tutorial
-    // Data might already be loading from splash screen, but ensure it continues
-    if (!dataPreloader.isDataLoading()) {
-      dataPreloader.preloadAll().catch(console.error);
-    }
-  }, []);
 
   useEffect(() => {
     // If going backward, allow immediate navigation

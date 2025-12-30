@@ -22,7 +22,6 @@ import {
   verifyPIN,
   setBiometricEnabled,
 } from '../lib/auth';
-import { dataPreloader } from '../lib/dataPreloader';
 import { navigateAfterAuth } from '../lib/tutorial';
 
 export default function AuthScreen() {
@@ -37,11 +36,6 @@ export default function AuthScreen() {
 
   useEffect(() => {
     checkAuthStatus();
-    // Continue preloading data during authentication
-    // Data might already be loading, but ensure it continues
-    if (!dataPreloader.isDataLoading()) {
-      dataPreloader.preloadAll().catch(console.error);
-    }
   }, []);
 
   const checkAuthStatus = async () => {

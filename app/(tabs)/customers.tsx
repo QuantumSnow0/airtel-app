@@ -15,6 +15,7 @@ import {
 import { Calendar } from "react-native-calendars";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { getSupabaseClient, isSupabaseConfigured } from "../../lib/supabase";
+import { handleSupabaseError } from "../../lib/supabase-error-handler";
 
 const FILTER_STORAGE_KEY = "@airtel_customer_town_filter";
 const VISIT_DATE_FILTER_KEY = "@airtel_customer_visit_date_filter";
@@ -41,7 +42,7 @@ interface Customer {
 export default function CustomersScreen() {
   const [premiumCount, setPremiumCount] = useState<number | null>(null);
   const [standardCount, setStandardCount] = useState<number | null>(null);
-  const [customers, setCustomers] = useState<Customer[]>([]);
+  const [allCustomers, setAllCustomers] = useState<Customer[]>([]); // Store all loaded customers
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -62,10 +63,16 @@ export default function CustomersScreen() {
     if (isSupabaseConfigured) {
       loadSavedFilter();
       loadSavedVisitDateFilter();
-      fetchTowns();
-      fetchVisitDates();
-      fetchCounts(true); // Show loading on initial fetch
-      fetchCustomers(true); // Show loading on initial fetch
+      
+      // Run initial data fetches in parallel for better performance
+      Promise.all([
+        fetchTowns(),
+        fetchVisitDates(),
+        fetchCounts(true), // Show loading on initial fetch
+        fetchCustomers(true), // Show loading on initial fetch
+      ]).catch((error) => {
+        console.error("Error loading initial data:", error);
+      });
 
       // Set up Realtime subscription
       const supabase = getSupabaseClient();
@@ -97,11 +104,78 @@ export default function CustomersScreen() {
     }
   }, []);
 
+  // Generate phone number search patterns for different formats
+  const getPhoneSearchPatterns = (searchQuery: string): string[] => {
+    // Remove any non-digit characters
+    const digits = searchQuery.replace(/\D/g, "");
+    if (digits.length === 0) return [];
+
+    const patterns: string[] = [];
+
+    // If it starts with 0, try both 0 and 254 formats
+    if (digits.startsWith("0")) {
+      // Original: 07248...
+      patterns.push(digits);
+      // With 254: 2547248...
+      patterns.push("254" + digits.substring(1));
+    } else if (digits.startsWith("254")) {
+      // If it starts with 254, try both formats
+      patterns.push(digits);
+      // With 0: 07248...
+      patterns.push("0" + digits.substring(3));
+    } else {
+      // If it doesn't start with 0 or 254, try both
+      patterns.push("0" + digits);
+      patterns.push("254" + digits);
+    }
+
+    return patterns;
+  };
+
+  // Only refetch from database when town or visit date filters change
   useEffect(() => {
     if (isSupabaseConfigured) {
       fetchCustomers();
     }
-  }, [searchQuery, selectedTown, selectedVisitDate]);
+  }, [selectedTown, selectedVisitDate]); // Removed searchQuery - will filter client-side
+
+  // Filter customers client-side based on search query (instant, no database query)
+  const filteredCustomers = React.useMemo(() => {
+    if (!searchQuery.trim()) {
+      return allCustomers;
+    }
+
+    const query = searchQuery.toLowerCase().trim();
+    const phonePatterns = getPhoneSearchPatterns(searchQuery);
+
+    return allCustomers.filter((customer) => {
+      // Search in customer name
+      if (customer.customer_name?.toLowerCase().includes(query)) {
+        return true;
+      }
+
+      // Search in installation town
+      if (customer.installation_town?.toLowerCase().includes(query)) {
+        return true;
+      }
+
+      // Search in phone numbers
+      const airtelNumber = customer.airtel_number?.toLowerCase() || "";
+      const alternateNumber = customer.alternate_number?.toLowerCase() || "";
+
+      if (phonePatterns.length > 0) {
+        // Use phone patterns if available
+        return phonePatterns.some(
+          (pattern) =>
+            airtelNumber.includes(pattern.toLowerCase()) ||
+            alternateNumber.includes(pattern.toLowerCase())
+        );
+      } else {
+        // Fallback: search as-is
+        return airtelNumber.includes(query) || alternateNumber.includes(query);
+      }
+    });
+  }, [allCustomers, searchQuery]);
 
   // Update marked dates when dates or selection changes
   useEffect(() => {
@@ -180,12 +254,17 @@ export default function CustomersScreen() {
 
     try {
       const supabase = getSupabaseClient();
+      // Use DISTINCT via grouping and limit to improve performance
       const { data, error } = await supabase
         .from("leads")
         .select("installation_town")
-        .order("installation_town", { ascending: true });
+        .neq("resubmitted", true) // Exclude resubmitted
+        .not("installation_town", "is", null)
+        .order("installation_town", { ascending: true })
+        .limit(1000); // Reasonable limit for unique towns
 
       if (error) {
+        handleSupabaseError(error);
         console.error("Error fetching towns:", error);
         setAvailableTowns([]);
       } else {
@@ -208,20 +287,25 @@ export default function CustomersScreen() {
 
     try {
       const supabase = getSupabaseClient();
+      // Limit to recent dates for better performance
       const { data, error } = await supabase
         .from("leads")
         .select("visit_date")
+        .neq("resubmitted", true) // Exclude resubmitted
         .not("visit_date", "is", null)
-        .order("visit_date", { ascending: true });
+        .order("visit_date", { ascending: false }) // Most recent first
+        .limit(500); // Limit to 500 most recent dates
 
       if (error) {
+        handleSupabaseError(error);
         console.error("Error fetching visit dates:", error);
         setAvailableVisitDates([]);
       } else {
-        // Get unique visit dates
+        // Get unique visit dates and reverse to show oldest first
         const uniqueDates = Array.from(
           new Set(data?.map((item) => item.visit_date) || [])
-        ).filter((date) => date && date.trim() !== "");
+        ).filter((date) => date && date.trim() !== "")
+        .reverse(); // Reverse to show oldest first
         setAvailableVisitDates(uniqueDates);
       }
     } catch (error) {
@@ -240,30 +324,37 @@ export default function CustomersScreen() {
       if (showLoadingState) setLoading(true);
       const supabase = getSupabaseClient();
 
-      // Fetch premium customers count (assuming "premium" is in preferred_package)
-      const { count: premium, error: premiumError } = await supabase
-        .from("leads")
-        .select("*", { count: "exact", head: true })
-        .ilike("preferred_package", "%premium%");
+      // Run both count queries in parallel for better performance
+      const [premiumResult, standardResult] = await Promise.all([
+        // Fetch premium customers count (excluding resubmitted)
+        supabase
+          .from("leads")
+          .select("*", { count: "exact", head: true })
+          .ilike("preferred_package", "%premium%")
+          .neq("resubmitted", true),
+        
+        // Fetch standard customers count (excluding resubmitted)
+        supabase
+          .from("leads")
+          .select("*", { count: "exact", head: true })
+          .ilike("preferred_package", "%standard%")
+          .neq("resubmitted", true),
+      ]);
 
-      if (premiumError) {
-        console.error("Error fetching premium count:", premiumError);
+      if (premiumResult.error) {
+        handleSupabaseError(premiumResult.error);
+        console.error("Error fetching premium count:", premiumResult.error);
         setPremiumCount(0);
       } else {
-        setPremiumCount(premium || 0);
+        setPremiumCount(premiumResult.count || 0);
       }
 
-      // Fetch standard customers count (assuming "standard" is in preferred_package)
-      const { count: standard, error: standardError } = await supabase
-        .from("leads")
-        .select("*", { count: "exact", head: true })
-        .ilike("preferred_package", "%standard%");
-
-      if (standardError) {
-        console.error("Error fetching standard count:", standardError);
+      if (standardResult.error) {
+        handleSupabaseError(standardResult.error);
+        console.error("Error fetching standard count:", standardResult.error);
         setStandardCount(0);
       } else {
-        setStandardCount(standard || 0);
+        setStandardCount(standardResult.count || 0);
       }
     } catch (error) {
       console.error("Error:", error);
@@ -289,8 +380,10 @@ export default function CustomersScreen() {
         .select(
           "id, customer_name, installation_town, airtel_number, alternate_number, email, preferred_package, delivery_landmark, visit_date, visit_time, created_at, agent_name, agent_mobile, lead_type, connection_type"
         )
+        .neq("resubmitted", true) // Exclude resubmitted customers
         .order("installation_town", { ascending: true })
-        .order("customer_name", { ascending: true });
+        .order("customer_name", { ascending: true })
+        .limit(500); // Limit to 500 most recent for performance
 
       // Apply town filter
       if (selectedTown) {
@@ -302,37 +395,17 @@ export default function CustomersScreen() {
         query = query.eq("visit_date", selectedVisitDate);
       }
 
-      // Apply search filter if there's a query
-      if (searchQuery.trim()) {
-        const phonePatterns = getPhoneSearchPatterns(searchQuery);
-
-        // Build search conditions
-        let searchConditions = `customer_name.ilike.%${searchQuery}%,installation_town.ilike.%${searchQuery}%`;
-
-        // Add phone number search patterns
-        if (phonePatterns.length > 0) {
-          const airtelConditions = phonePatterns
-            .map((p) => `airtel_number.ilike.%${p}%`)
-            .join(",");
-          const alternateConditions = phonePatterns
-            .map((p) => `alternate_number.ilike.%${p}%`)
-            .join(",");
-          searchConditions += `,${airtelConditions},${alternateConditions}`;
-        } else {
-          // Fallback: search as-is if no phone patterns
-          searchConditions += `,airtel_number.ilike.%${searchQuery}%,alternate_number.ilike.%${searchQuery}%`;
-        }
-
-        query = query.or(searchConditions);
-      }
+      // Don't apply search filter here - will filter client-side
+      // Only apply town and visit date filters (server-side)
 
       const { data, error } = await query;
 
       if (error) {
+        handleSupabaseError(error);
         console.error("Error fetching customers:", error);
-        setCustomers([]);
+        setAllCustomers([]);
       } else {
-        setCustomers(data || []);
+        setAllCustomers(data || []);
       }
     } catch (error) {
       console.error("Error:", error);
@@ -530,45 +603,6 @@ export default function CustomersScreen() {
     return cleaned;
   };
 
-  // Generate phone number search patterns for different formats
-  const getPhoneSearchPatterns = (searchQuery: string): string[] => {
-    // Remove any non-digit characters
-    const digits = searchQuery.replace(/\D/g, "");
-    if (digits.length === 0) return [];
-
-    const patterns: string[] = [];
-
-    // If it starts with 0, try both 0 and 254 formats
-    if (digits.startsWith("0")) {
-      // Original: 07248...
-      patterns.push(digits);
-      // With 254: 2547248...
-      patterns.push("254" + digits.substring(1));
-      // Without leading 0: 7248...
-      patterns.push(digits.substring(1));
-    }
-    // If it starts with 254, try both 254 and 0 formats
-    else if (digits.startsWith("254")) {
-      // Original: 2547248...
-      patterns.push(digits);
-      // With 0: 07248...
-      patterns.push("0" + digits.substring(3));
-      // Without 254: 7248...
-      patterns.push(digits.substring(3));
-    }
-    // If it's just digits (no prefix), try all formats
-    else {
-      // As-is: 7248...
-      patterns.push(digits);
-      // With 0: 07248...
-      patterns.push("0" + digits);
-      // With 254: 2547248...
-      patterns.push("254" + digits);
-    }
-
-    return [...new Set(patterns)]; // Remove duplicates
-  };
-
   // Get full phone number with +254 prefix for calling
   const getFullPhoneNumber = (phone: string) => {
     if (!phone) return phone;
@@ -739,16 +773,16 @@ export default function CustomersScreen() {
             />
           }
         >
-          {loading && customers.length === 0 ? (
+          {loading && allCustomers.length === 0 ? (
             <View style={styles.emptyState}>
               <Text style={styles.emptyText}>Loading...</Text>
             </View>
-          ) : customers.length === 0 ? (
+          ) : filteredCustomers.length === 0 ? (
             <View style={styles.emptyState}>
               <Text style={styles.emptyText}>No customers found</Text>
             </View>
           ) : (
-            customers.map((customer) => {
+            filteredCustomers.map((customer) => {
               const isExpanded = expandedCustomerId === customer.id;
               return (
                 <View key={customer.id}>
