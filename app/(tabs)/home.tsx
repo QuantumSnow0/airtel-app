@@ -397,6 +397,161 @@ export default function HomeScreen() {
     }
   };
 
+  // Check if two names are similar (case-insensitive match)
+  const areNamesSimilar = (name1: string, name2: string): boolean => {
+    if (!name1 || !name2) return false;
+    return name1.trim().toLowerCase() === name2.trim().toLowerCase();
+  };
+
+  // Check if all details match (excluding timestamps)
+  const allDetailsMatch = (lead1: Lead, lead2: Lead): boolean => {
+    return (
+      lead1.customer_name === lead2.customer_name &&
+      lead1.airtel_number === lead2.airtel_number &&
+      lead1.alternate_number === lead2.alternate_number &&
+      lead1.email === lead2.email &&
+      lead1.preferred_package === lead2.preferred_package &&
+      lead1.installation_town === lead2.installation_town &&
+      lead1.delivery_landmark === lead2.delivery_landmark &&
+      lead1.agent_type === lead2.agent_type &&
+      lead1.enterprise_cp === lead2.enterprise_cp &&
+      lead1.agent_name === lead2.agent_name &&
+      lead1.agent_mobile === lead2.agent_mobile &&
+      lead1.lead_type === lead2.lead_type &&
+      lead1.connection_type === lead2.connection_type
+    );
+  };
+
+  // Helper function to check if a customer is "Unknown Customer"
+  const isUnknownCustomer = (lead: Lead): boolean => {
+    const name = (lead.customer_name || "").trim().toLowerCase();
+    return name === "unknown customer" || name === "";
+  };
+
+  // Helper function to check if two leads are duplicates (using same logic as checkDuplicateStatus)
+  // Note: This uses only the fields we fetch for counting (name, phones, email)
+  const areLeadsDuplicates = (lead1: Lead, lead2: Lead): boolean => {
+    // Skip if either has bypass_duplicate_check flag
+    if (lead1.bypass_duplicate_check === true || lead2.bypass_duplicate_check === true) {
+      return false;
+    }
+
+    // Check 1: Both phone numbers + email match → RED duplicate
+    if (
+      lead1.airtel_number &&
+      lead2.airtel_number &&
+      lead1.alternate_number &&
+      lead2.alternate_number &&
+      lead1.airtel_number === lead2.airtel_number &&
+      lead1.alternate_number === lead2.alternate_number &&
+      lead1.email &&
+      lead1.email === lead2.email
+    ) {
+      return true;
+    }
+
+    // Check 2: Same customer_name + same airtel_number → RED duplicate
+    if (
+      lead1.customer_name &&
+      lead2.customer_name &&
+      lead1.airtel_number &&
+      lead2.airtel_number &&
+      lead1.customer_name === lead2.customer_name &&
+      lead1.airtel_number === lead2.airtel_number
+    ) {
+      return true;
+    }
+
+    // Check 3: Similar customer names (case-insensitive) with at least one phone number matches → RED duplicate
+    if (
+      areNamesSimilar(lead1.customer_name, lead2.customer_name) &&
+      ((lead1.airtel_number && lead2.airtel_number && lead1.airtel_number === lead2.airtel_number) ||
+        (lead1.alternate_number && lead2.alternate_number && lead1.alternate_number === lead2.alternate_number))
+    ) {
+      return true;
+    }
+
+    // Check 4: Both phone numbers match (even if names differ) → RED duplicate
+    if (
+      lead1.airtel_number &&
+      lead2.airtel_number &&
+      lead1.alternate_number &&
+      lead2.alternate_number &&
+      lead1.airtel_number === lead2.airtel_number &&
+      lead1.alternate_number === lead2.alternate_number
+    ) {
+      return true;
+    }
+
+    // Check 5: Same airtel_number OR same alternate_number (if both have the same number) → RED duplicate
+    // This catches cases where one lead has airtel_number and the other has it as alternate_number
+    if (
+      lead1.airtel_number &&
+      lead2.airtel_number &&
+      lead1.airtel_number === lead2.airtel_number
+    ) {
+      return true;
+    }
+    if (
+      lead1.alternate_number &&
+      lead2.alternate_number &&
+      lead1.alternate_number === lead2.alternate_number
+    ) {
+      return true;
+    }
+    // Cross-match: airtel_number matches alternate_number
+    if (
+      lead1.airtel_number &&
+      lead2.alternate_number &&
+      lead1.airtel_number === lead2.alternate_number
+    ) {
+      return true;
+    }
+    if (
+      lead1.alternate_number &&
+      lead2.airtel_number &&
+      lead1.alternate_number === lead2.airtel_number
+    ) {
+      return true;
+    }
+
+    return false;
+  };
+
+  // Helper function to count unique customers from leads
+  const countUniqueCustomers = (leads: Lead[]): number => {
+    // Filter out resubmitted and unknown customers
+    const validLeads = leads.filter(
+      (lead) => lead.resubmitted !== true && !isUnknownCustomer(lead)
+    );
+
+    // Separate bypassed leads (count each as unique)
+    const bypassedLeads = validLeads.filter(
+      (lead) => lead.bypass_duplicate_check === true
+    );
+    const regularLeads = validLeads.filter(
+      (lead) => lead.bypass_duplicate_check !== true
+    );
+
+    // Count unique regular leads (excluding duplicates)
+    const uniqueLeads: Lead[] = [];
+    
+    for (const lead of regularLeads) {
+      // Check if this lead is a duplicate of any already counted lead
+      const isDuplicate = uniqueLeads.some((existingLead) =>
+        areLeadsDuplicates(lead, existingLead)
+      );
+
+      // Only add if it's not a duplicate
+      if (!isDuplicate) {
+        uniqueLeads.push(lead);
+      }
+    }
+
+    // Total unique count = unique regular leads + all bypassed leads
+    return uniqueLeads.length + bypassedLeads.length;
+  };
+
   const fetchCounts = async (showLoading = true) => {
     if (!isSupabaseConfigured) {
       setLoading(false);
@@ -420,26 +575,33 @@ export default function HomeScreen() {
       yesterdayDate.setDate(yesterdayDate.getDate() - 1);
       const yesterdayStart = yesterdayDate.toISOString();
 
-      // Run all count queries in parallel for better performance
-      const [totalResult, todayResult, yesterdayResult, leadsResult] = await Promise.all([
-        // Total count (excluding resubmitted)
+      // Fetch all leads data for unique counting (excluding resubmitted)
+      // We need the actual data to calculate unique customers
+      const [allLeadsResult, todayLeadsResult, yesterdayLeadsResult, leadsResult] = await Promise.all([
+        // All leads (excluding resubmitted) - fetch all for unique counting
         supabase
           .from("leads")
-          .select("*", { count: "exact", head: true })
+          .select(
+            "id, customer_name, airtel_number, alternate_number, email, bypass_duplicate_check, resubmitted, created_at"
+          )
           .neq("resubmitted", true),
         
-        // Today's count
+        // Today's leads
         supabase
           .from("leads")
-          .select("*", { count: "exact", head: true })
+          .select(
+            "id, customer_name, airtel_number, alternate_number, email, bypass_duplicate_check, resubmitted, created_at"
+          )
           .gte("created_at", todayStart)
           .lt("created_at", tomorrowStart)
           .neq("resubmitted", true),
         
-        // Yesterday's count
+        // Yesterday's leads
         supabase
           .from("leads")
-          .select("*", { count: "exact", head: true })
+          .select(
+            "id, customer_name, airtel_number, alternate_number, email, bypass_duplicate_check, resubmitted, created_at"
+          )
           .gte("created_at", yesterdayStart)
           .lt("created_at", todayStart)
           .neq("resubmitted", true),
@@ -454,29 +616,32 @@ export default function HomeScreen() {
           .limit(200), // Limit to 200 most recent leads for faster loading
       ]);
 
-      // Handle count results
-      if (totalResult.error) {
-        handleSupabaseError(totalResult.error);
-        console.error("Error fetching total count:", totalResult.error);
+      // Calculate unique counts
+      if (allLeadsResult.error) {
+        handleSupabaseError(allLeadsResult.error);
+        console.error("Error fetching total leads:", allLeadsResult.error);
         setTotalCount(0);
       } else {
-        setTotalCount(totalResult.count || 0);
+        const uniqueTotalCount = countUniqueCustomers(allLeadsResult.data || []);
+        setTotalCount(uniqueTotalCount);
       }
 
-      if (todayResult.error) {
-        handleSupabaseError(todayResult.error);
-        console.error("Error fetching today's count:", todayResult.error);
+      if (todayLeadsResult.error) {
+        handleSupabaseError(todayLeadsResult.error);
+        console.error("Error fetching today's leads:", todayLeadsResult.error);
         setTodayCount(0);
       } else {
-        setTodayCount(todayResult.count || 0);
+        const uniqueTodayCount = countUniqueCustomers(todayLeadsResult.data || []);
+        setTodayCount(uniqueTodayCount);
       }
 
-      if (yesterdayResult.error) {
-        handleSupabaseError(yesterdayResult.error);
-        console.error("Error fetching yesterday's count:", yesterdayResult.error);
+      if (yesterdayLeadsResult.error) {
+        handleSupabaseError(yesterdayLeadsResult.error);
+        console.error("Error fetching yesterday's leads:", yesterdayLeadsResult.error);
         setYesterdayCount(0);
       } else {
-        setYesterdayCount(yesterdayResult.count || 0);
+        const uniqueYesterdayCount = countUniqueCustomers(yesterdayLeadsResult.data || []);
+        setYesterdayCount(uniqueYesterdayCount);
       }
 
       // Handle leads data
@@ -599,31 +764,6 @@ export default function HomeScreen() {
         return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
       })
       .join(" ");
-  };
-
-  // Check if two names are similar (case-insensitive match)
-  const areNamesSimilar = (name1: string, name2: string): boolean => {
-    if (!name1 || !name2) return false;
-    return name1.trim().toLowerCase() === name2.trim().toLowerCase();
-  };
-
-  // Check if all details match (excluding timestamps)
-  const allDetailsMatch = (lead1: Lead, lead2: Lead): boolean => {
-    return (
-      lead1.customer_name === lead2.customer_name &&
-      lead1.airtel_number === lead2.airtel_number &&
-      lead1.alternate_number === lead2.alternate_number &&
-      lead1.email === lead2.email &&
-      lead1.preferred_package === lead2.preferred_package &&
-      lead1.installation_town === lead2.installation_town &&
-      lead1.delivery_landmark === lead2.delivery_landmark &&
-      lead1.agent_type === lead2.agent_type &&
-      lead1.enterprise_cp === lead2.enterprise_cp &&
-      lead1.agent_name === lead2.agent_name &&
-      lead1.agent_mobile === lead2.agent_mobile &&
-      lead1.lead_type === lead2.lead_type &&
-      lead1.connection_type === lead2.connection_type
-    );
   };
 
   // Check duplicate status for a lead
@@ -826,13 +966,6 @@ export default function HomeScreen() {
     return null;
   };
 
-  // Check if two leads are duplicates of each other
-  const areLeadsDuplicates = (lead1: Lead, lead2: Lead): boolean => {
-    if (lead1.id === lead2.id) return false;
-    const status = checkDuplicateStatus(lead1, [lead2]);
-    return status === "red" || status === "orange";
-  };
-
   // Group leads that are duplicates of each other
   const groupDuplicates = (allLeads: Lead[]): Map<string, string[]> => {
     const groups = new Map<string, string[]>();
@@ -848,7 +981,9 @@ export default function HomeScreen() {
       allLeads.forEach((otherLead) => {
         if (lead.id === otherLead.id || processed.has(otherLead.id)) return;
 
-        if (areLeadsDuplicates(lead, otherLead)) {
+        // Use checkDuplicateStatus to check for both red and orange duplicates
+        const status = checkDuplicateStatus(lead, [otherLead]);
+        if (status === "red" || status === "orange") {
           group.push(otherLead.id);
           processed.add(otherLead.id);
         }

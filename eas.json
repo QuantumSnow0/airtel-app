@@ -23,6 +23,11 @@
         "EXPO_PUBLIC_ENV": "preview"
       }
     },
+    "apk": {
+      "android": {
+        "buildType": "apk"
+      }
+    },
     "production": {
       "autoIncrement": true
     }

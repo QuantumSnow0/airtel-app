@@ -16,7 +16,7 @@ export default function TabsLayout() {
 
         // 🧱 MAIN FIXES ARE HERE
         tabBarStyle: {
-          backgroundColor: "transparent",
+          backgroundColor: "rgba(10, 10, 10, 0.95)", // Dark background with slight transparency
           borderTopWidth: 0,
           height: 64, // fixed height (no extra inset here)
           position: "absolute",
