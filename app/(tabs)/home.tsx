@@ -8,7 +8,6 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
-  Dimensions,
   Linking,
   Modal,
   RefreshControl,
@@ -16,11 +15,11 @@ import {
   StyleSheet,
   Text,
   TouchableOpacity,
-  View,
+  View
 } from "react-native";
 import { Calendar } from "react-native-calendars";
-import { LineChart } from "react-native-chart-kit";
 import { SafeAreaView } from "react-native-safe-area-context";
+import Svg, { Circle } from "react-native-svg";
 import * as XLSX from "xlsx";
 import { dataPreloader } from "../../lib/dataPreloader";
 import { getSupabaseClient, isSupabaseConfigured } from "../../lib/supabase";
@@ -108,6 +107,16 @@ export default function HomeScreen() {
   const [pendingExportOption, setPendingExportOption] = useState<
     "full" | "airtel" | "alternate" | null
   >(null);
+  
+  // Monthly progress state
+  const TARGET_MONTHLY = 1000;
+  const [currentMonthCount, setCurrentMonthCount] = useState<number | null>(null);
+  const [monthLoading, setMonthLoading] = useState(false);
+  const [selectedMonth, setSelectedMonth] = useState(() => {
+    const now = new Date();
+    return { year: now.getFullYear(), month: now.getMonth() };
+  });
+  const progressAnimation = useRef(new Animated.Value(0)).current;
 
   // Fetch available towns for filter
   const fetchTowns = useCallback(async () => {
@@ -198,6 +207,9 @@ export default function HomeScreen() {
         fetchCounts();
       }
 
+      // Initialize monthly progress
+      fetchMonthCount(selectedMonth.year, selectedMonth.month, false);
+
       // Set up Realtime subscription
       const supabase = getSupabaseClient();
       const channel = supabase
@@ -233,6 +245,12 @@ export default function HomeScreen() {
 
             // Refetch counts when any change occurs (without showing loading)
             fetchCounts(false);
+            
+            // Update monthly progress if viewing current month
+            const currentDate = new Date();
+            if (selectedMonth.year === currentDate.getFullYear() && selectedMonth.month === currentDate.getMonth()) {
+              fetchMonthCount(selectedMonth.year, selectedMonth.month, false);
+            }
           }
         )
         .on(
@@ -245,6 +263,11 @@ export default function HomeScreen() {
           () => {
             // Refetch counts when any update occurs
             fetchCounts(false);
+            // Update monthly progress if viewing current month
+            const currentDate = new Date();
+            if (selectedMonth.year === currentDate.getFullYear() && selectedMonth.month === currentDate.getMonth()) {
+              fetchMonthCount(selectedMonth.year, selectedMonth.month, false);
+            }
           }
         )
         .subscribe();
@@ -586,15 +609,14 @@ export default function HomeScreen() {
           )
           .neq("resubmitted", true),
         
-        // Today's leads
+        // Today's leads (including resubmitted)
         supabase
           .from("leads")
           .select(
             "id, customer_name, airtel_number, alternate_number, email, bypass_duplicate_check, resubmitted, created_at"
           )
           .gte("created_at", todayStart)
-          .lt("created_at", tomorrowStart)
-          .neq("resubmitted", true),
+          .lt("created_at", tomorrowStart),
         
         // Yesterday's leads
         supabase
@@ -631,7 +653,33 @@ export default function HomeScreen() {
         console.error("Error fetching today's leads:", todayLeadsResult.error);
         setTodayCount(0);
       } else {
-        const uniqueTodayCount = countUniqueCustomers(todayLeadsResult.data || []);
+        // For today's count, include resubmitted and count unique
+        const todayLeads = (todayLeadsResult.data || []).filter(
+          (lead) => {
+            const name = (lead.customer_name || "").trim().toLowerCase();
+            return name !== "unknown customer" && name !== "";
+          }
+        );
+
+        const bypassedLeads = todayLeads.filter(
+          (lead) => lead.bypass_duplicate_check === true
+        );
+        const regularLeads = todayLeads.filter(
+          (lead) => lead.bypass_duplicate_check !== true
+        );
+
+        const uniqueLeads: Lead[] = [];
+        
+        for (const lead of regularLeads) {
+          const isDuplicate = uniqueLeads.some((existingLead) =>
+            areLeadsDuplicates(lead, existingLead)
+          );
+          if (!isDuplicate) {
+            uniqueLeads.push(lead);
+          }
+        }
+
+        const uniqueTodayCount = uniqueLeads.length + bypassedLeads.length;
         setTodayCount(uniqueTodayCount);
       }
 
@@ -653,9 +701,8 @@ export default function HomeScreen() {
         setLeads(leadsResult.data || []);
       }
 
-      // Fetch daily registration data for graph (based on selected range)
-      // Use the current graphDateRange state value
-      await fetchGraphData(graphDateRange);
+      // Fetch monthly progress data
+      await fetchMonthCount(selectedMonth.year, selectedMonth.month, false);
     } catch (error) {
       console.error("Unexpected error in fetchCounts:", {
         error,
@@ -670,6 +717,184 @@ export default function HomeScreen() {
         setLoading(false);
       }
     }
+  };
+
+  // Fetch selected month count
+  const fetchMonthCount = async (year: number, month: number, showLoading = true) => {
+    if (!isSupabaseConfigured) {
+      setMonthLoading(false);
+      return;
+    }
+
+    try {
+      if (showLoading) {
+        setMonthLoading(true);
+      }
+
+      const supabase = getSupabaseClient();
+
+      // Get first and last day of selected month
+      const firstDay = new Date(year, month, 1);
+      const lastDay = new Date(year, month + 1, 0, 23, 59, 59, 999);
+
+      const monthStart = firstDay.toISOString();
+      const monthEnd = lastDay.toISOString();
+
+      // Fetch all leads for selected month (excluding resubmitted)
+      const { data: leads, error } = await supabase
+        .from("leads")
+        .select("id, customer_name, airtel_number, alternate_number, email, bypass_duplicate_check, resubmitted, created_at")
+        .gte("created_at", monthStart)
+        .lte("created_at", monthEnd)
+        .neq("resubmitted", true);
+
+      if (error) {
+        handleSupabaseError(error);
+        console.error("Error fetching month leads:", error);
+        setCurrentMonthCount(0);
+      } else {
+        // Use the comprehensive duplicate detection logic
+        const uniqueCount = countUniqueCustomers(leads || []);
+        setCurrentMonthCount(uniqueCount);
+      }
+    } catch (error) {
+      console.error("Unexpected error in fetchMonthCount:", error);
+      setCurrentMonthCount(0);
+    } finally {
+      if (showLoading) {
+        setMonthLoading(false);
+      }
+    }
+  };
+
+  // Animate progress when count changes
+  useEffect(() => {
+    if (currentMonthCount !== null) {
+      const progress = Math.min(currentMonthCount / TARGET_MONTHLY, 1);
+      Animated.timing(progressAnimation, {
+        toValue: progress,
+        duration: 1000,
+        useNativeDriver: false,
+      }).start();
+    }
+  }, [currentMonthCount, progressAnimation]);
+
+  // Fetch data when selected month changes
+  useEffect(() => {
+    fetchMonthCount(selectedMonth.year, selectedMonth.month);
+  }, [selectedMonth]);
+
+  // Get month name
+  const getMonthName = (year: number, month: number) => {
+    const months = [
+      "January", "February", "March", "April", "May", "June",
+      "July", "August", "September", "October", "November", "December"
+    ];
+    return `${months[month]} ${year}`;
+  };
+
+  // Navigate to previous month
+  const goToPreviousMonth = () => {
+    setSelectedMonth((prev) => {
+      if (prev.month === 0) {
+        return { year: prev.year - 1, month: 11 };
+      }
+      return { year: prev.year, month: prev.month - 1 };
+    });
+  };
+
+  // Navigate to next month
+  const goToNextMonth = () => {
+    const now = new Date();
+    const maxDate = { year: now.getFullYear(), month: now.getMonth() };
+    
+    setSelectedMonth((prev) => {
+      // Don't allow going to future months
+      if (prev.year > maxDate.year || (prev.year === maxDate.year && prev.month >= maxDate.month)) {
+        return prev;
+      }
+      
+      if (prev.month === 11) {
+        return { year: prev.year + 1, month: 0 };
+      }
+      return { year: prev.year, month: prev.month + 1 };
+    });
+  };
+
+  // Check if selected month is current month
+  const isCurrentMonth = () => {
+    const now = new Date();
+    return selectedMonth.year === now.getFullYear() && selectedMonth.month === now.getMonth();
+  };
+
+  // Calculate progress percentage
+  const progress = currentMonthCount !== null 
+    ? Math.min(currentMonthCount / TARGET_MONTHLY, 1) 
+    : 0;
+  
+  const progressPercentage = Math.round(progress * 100);
+
+  // Circular progress component
+  const CircularProgress = ({ size = 280, strokeWidth = 20 }: { size?: number; strokeWidth?: number }) => {
+    const radius = (size - strokeWidth) / 2;
+    const circumference = 2 * Math.PI * radius;
+    const [animatedValue, setAnimatedValue] = useState(0);
+
+    useEffect(() => {
+      const listener = progressAnimation.addListener(({ value }) => {
+        setAnimatedValue(value);
+      });
+      return () => {
+        progressAnimation.removeListener(listener);
+      };
+    }, []);
+
+    const strokeDashoffset = circumference * (1 - animatedValue);
+
+    return (
+      <View style={styles.progressContainer}>
+        <Svg width={size} height={size} style={styles.progressSvg}>
+          {/* Background circle */}
+          <Circle
+            cx={size / 2}
+            cy={size / 2}
+            r={radius}
+            stroke="#2A2A2A"
+            strokeWidth={strokeWidth}
+            fill="transparent"
+          />
+          {/* Progress circle */}
+          <Circle
+            cx={size / 2}
+            cy={size / 2}
+            r={radius}
+            stroke="#FFD700"
+            strokeWidth={strokeWidth}
+            fill="transparent"
+            strokeDasharray={circumference}
+            strokeDashoffset={strokeDashoffset}
+            strokeLinecap="round"
+            transform={`rotate(-90 ${size / 2} ${size / 2})`}
+          />
+        </Svg>
+        <View style={styles.progressContent}>
+          {monthLoading ? (
+            <ActivityIndicator size="large" color="#FFD700" />
+          ) : (
+            <>
+              <Text style={styles.progressNumber}>
+                {currentMonthCount !== null ? currentMonthCount : 0}
+              </Text>
+              <Text style={styles.progressTarget}>/ {TARGET_MONTHLY}</Text>
+              <Text style={styles.progressLabel}>
+                {isCurrentMonth() ? "This Month" : getMonthName(selectedMonth.year, selectedMonth.month).split(" ")[0]}
+              </Text>
+              <Text style={styles.progressPercentage}>{progressPercentage}%</Text>
+            </>
+          )}
+        </View>
+      </View>
+    );
   };
 
   // Format date as "4 thurs 2025"
@@ -1720,171 +1945,52 @@ export default function HomeScreen() {
         </View>
       </View>
 
-      {/* Graph Section */}
+      {/* Monthly Progress Section */}
       <View style={styles.graphContainer}>
-        {/* Date Range Filters */}
-        <View style={styles.graphHeader}>
-          <View style={styles.graphTitleContainer}>
-            <Text style={styles.graphTitle}>Registrations</Text>
-          </View>
-          <View style={styles.dateRangeButtons}>
-            <TouchableOpacity
-              style={[styles.dateRangeButton, graphDateRange === "7d" && styles.dateRangeButtonActive, graphLoading && styles.dateRangeButtonDisabled]}
-              onPress={async () => {
-                if (graphDateRange === "7d" || graphLoading) return;
-                setGraphLoading(true);
-                setGraphDateRange("7d");
-                await fetchGraphData("7d");
-                setGraphLoading(false);
-              }}
-              disabled={graphLoading}
-            >
-              <Text style={[styles.dateRangeButtonText, graphDateRange === "7d" && styles.dateRangeButtonTextActive]}>
-                7d
-              </Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[
-                styles.dateRangeButton,
-                graphDateRange === "30d" && styles.dateRangeButtonActive,
-                graphLoading && styles.dateRangeButtonDisabled,
-              ]}
-              onPress={async () => {
-                if (graphDateRange === "30d" || graphLoading) return;
-                setGraphLoading(true);
-                setGraphDateRange("30d");
-                await fetchGraphData("30d");
-                setGraphLoading(false);
-              }}
-              disabled={graphLoading}
-            >
-              <Text style={[styles.dateRangeButtonText, graphDateRange === "30d" && styles.dateRangeButtonTextActive]}>
-                30d
-              </Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[
-                styles.dateRangeButton,
-                graphDateRange === "90d" && styles.dateRangeButtonActive,
-                graphLoading && styles.dateRangeButtonDisabled,
-              ]}
-              onPress={async () => {
-                if (graphDateRange === "90d" || graphLoading) return;
-                setGraphLoading(true);
-                setGraphDateRange("90d");
-                await fetchGraphData("90d");
-                setGraphLoading(false);
-              }}
-              disabled={graphLoading}
-            >
-              <Text style={[styles.dateRangeButtonText, graphDateRange === "90d" && styles.dateRangeButtonTextActive]}>
-                90d
-              </Text>
-            </TouchableOpacity>
-          </View>
-        </View>
+        <Text style={styles.monthlyTitle}>Monthly Target</Text>
         
-        <View style={styles.graph}>
-          {dailyData.length > 0 ? (
-            <View style={styles.chartArea}>
-              <View style={[styles.chartWrapper, { width: Dimensions.get("window").width - 40 }]}>
-                <LineChart
-                    data={{
-                      labels: dailyData.map((day, index) => {
-                        const date = new Date(day.date);
-                        if (graphDateRange === "7d") {
-                          return ["S", "M", "T", "W", "T", "F", "S"][date.getDay()];
-                        } else if (graphDateRange === "30d") {
-                          // Show every 5th label to avoid crowding (7 labels total)
-                          if (index % 5 === 0 || index === dailyData.length - 1) {
-                            return `${date.getMonth() + 1}/${date.getDate()}`;
-                          }
-                          return "";
-                        } else {
-                          // 90d - show every other week label (7 labels total)
-                          if (index % 2 === 0 || index === dailyData.length - 1) {
-                            return `${date.getMonth() + 1}/${date.getDate()}`;
-                          }
-                          return "";
-                        }
-                      }),
-                      datasets: [
-                        {
-                          data: dailyData.map((day) => day.count),
-                          color: (opacity = 1) => `rgba(255, 215, 0, 1)`, // Bright gold color (full opacity)
-                          strokeWidth: 1,
-                        },
-                      ],
-                    }}
-                  width={Dimensions.get("window").width - 40} // Container width (20px margin each side)
-                  height={220}
-                  chartConfig={{
-                    backgroundColor: "#1A1A1A",
-                    backgroundGradientFrom: "#1A1A1A",
-                    backgroundGradientTo: "#1A1A1A",
-                    decimalPlaces: 0,
-                    color: (opacity = 1) => `rgba(255, 215, 0, 1)`, // Bright gold (full opacity)
-                    labelColor: (opacity = 1) => `rgba(255, 255, 255, ${opacity})`,
-                    style: {
-                      borderRadius: 12,
-                    },
-                    propsForBackgroundLines: {
-                      strokeDasharray: "", // solid lines
-                      stroke: "#2A2A2A",
-                      strokeWidth: 1,
-                    },
-                    propsForLabels: {
-                      dx: 0.5, // Add left padding to Y-axis labels
-                    },
-                  }}
-                  bezier // Smooth curves
-                  style={{
-                    marginVertical: 8,
-                    marginLeft: 8, // Add left padding to the chart
-                    borderRadius: 12,
-                  }}
-                  withInnerLines={true}
-                  withOuterLines={false}
-                  withVerticalLines={false}
-                  withHorizontalLines={true}
-                  withDots={false}
-                  withShadow={false}
-                  segments={4}
-                  yAxisLabel=""
-                  yAxisSuffix=""
-                  yAxisInterval={1}
-                  fromZero={false}
-                  formatYLabel={(value) => {
-                    const num = parseInt(value);
-                    return num.toString();
-                  }}
-                  />
-              </View>
-            </View>
-          ) : (
-            <View style={styles.graphEmpty}>
-              <Text style={styles.graphEmptyText}>No data available</Text>
-            </View>
-          )}
-          {/* Loading bar overlay */}
-          {graphLoading && (
-            <View style={styles.graphLoadingOverlay}>
-              <View style={styles.loadingBarContainer}>
-                <Animated.View
-                  style={[
-                    {
-                      height: "100%",
-                      backgroundColor: "#FFD700",
-                      borderRadius: 1.5,
-                      width: loadingBarAnimation.interpolate({
-                        inputRange: [0, 1],
-                        outputRange: ["0%", "100%"],
-                      }),
-                    },
-                  ]}
-                />
-              </View>
-            </View>
+        {/* Month Selector */}
+        <View style={styles.monthSelector}>
+          <TouchableOpacity
+            onPress={goToPreviousMonth}
+            style={styles.monthNavButton}
+          >
+            <Ionicons name="chevron-back" size={24} color="#FFD700" />
+          </TouchableOpacity>
+          
+          <Text style={styles.monthName}>
+            {getMonthName(selectedMonth.year, selectedMonth.month)}
+          </Text>
+          
+          <TouchableOpacity
+            onPress={goToNextMonth}
+            style={[
+              styles.monthNavButton,
+              isCurrentMonth() && styles.monthNavButtonDisabled,
+            ]}
+            disabled={isCurrentMonth()}
+          >
+            <Ionicons
+              name="chevron-forward"
+              size={24}
+              color={isCurrentMonth() ? "#6B7280" : "#FFD700"}
+            />
+          </TouchableOpacity>
+        </View>
+
+        {/* Circular Progress */}
+        <CircularProgress size={280} strokeWidth={20} />
+        
+        <View style={styles.monthlyInfoContainer}>
+          <Text style={styles.monthlyInfoText}>
+            Target: {TARGET_MONTHLY.toLocaleString()} registrations per month
+          </Text>
+          {currentMonthCount !== null && (
+            <Text style={styles.monthlyRemainingText}>
+              {currentMonthCount < TARGET_MONTHLY
+                ? `${(TARGET_MONTHLY - currentMonthCount).toLocaleString()} remaining`
+                : "Target achieved! 🎉"}
+            </Text>
           )}
         </View>
       </View>
@@ -2754,6 +2860,30 @@ const styles = StyleSheet.create({
     fontFamily: "Inter_600SemiBold",
     color: "#FFD700",
   },
+  todayContainer: {
+    backgroundColor: "#1A1A1A",
+    borderRadius: 12,
+    padding: 20,
+    marginTop: 30,
+    marginHorizontal: 20,
+    width: "100%",
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#2A2A2A",
+  },
+  todayLabel: {
+    fontSize: 14,
+    fontFamily: "Inter_400Regular",
+    color: "#9CA3AF",
+    marginBottom: 8,
+    textTransform: "uppercase",
+    letterSpacing: 1,
+  },
+  todayCount: {
+    fontSize: 48,
+    fontFamily: "Inter_700Bold",
+    color: "#10B981",
+  },
   graphContainer: {
     marginTop: 30,
     marginHorizontal: 20,
@@ -2763,6 +2893,93 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     borderWidth: 1,
     borderColor: "#2A2A2A",
+    alignItems: "center",
+  },
+  monthlyTitle: {
+    fontSize: 20,
+    fontFamily: "Montserrat_600SemiBold",
+    color: "#FFD700",
+    marginBottom: 16,
+  },
+  monthSelector: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 24,
+    gap: 16,
+  },
+  monthNavButton: {
+    padding: 8,
+    borderRadius: 8,
+    backgroundColor: "rgba(255, 215, 0, 0.1)",
+  },
+  monthNavButtonDisabled: {
+    backgroundColor: "rgba(107, 114, 128, 0.1)",
+  },
+  monthName: {
+    fontSize: 18,
+    fontFamily: "Inter_600SemiBold",
+    color: "#FFD700",
+    minWidth: 180,
+    textAlign: "center",
+    textTransform: "capitalize",
+  },
+  progressContainer: {
+    position: "relative",
+    justifyContent: "center",
+    alignItems: "center",
+    marginVertical: 20,
+  },
+  progressSvg: {
+    transform: [{ rotate: "-90deg" }],
+  },
+  progressContent: {
+    position: "absolute",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  progressNumber: {
+    fontSize: 56,
+    fontFamily: "Inter_700Bold",
+    color: "#FFD700",
+    lineHeight: 64,
+  },
+  progressTarget: {
+    fontSize: 32,
+    fontFamily: "Inter_400Regular",
+    color: "#9CA3AF",
+    lineHeight: 40,
+  },
+  progressLabel: {
+    fontSize: 16,
+    fontFamily: "Inter_400Regular",
+    color: "#9CA3AF",
+    marginTop: 8,
+    textTransform: "uppercase",
+    letterSpacing: 1,
+  },
+  progressPercentage: {
+    fontSize: 24,
+    fontFamily: "Inter_600SemiBold",
+    color: "#FFD700",
+    marginTop: 4,
+  },
+  monthlyInfoContainer: {
+    marginTop: 20,
+    alignItems: "center",
+  },
+  monthlyInfoText: {
+    fontSize: 16,
+    fontFamily: "Inter_400Regular",
+    color: "#9CA3AF",
+    textAlign: "center",
+    marginBottom: 8,
+  },
+  monthlyRemainingText: {
+    fontSize: 18,
+    fontFamily: "Inter_600SemiBold",
+    color: "#FFD700",
+    textAlign: "center",
   },
   graphTitleContainer: {
     flex: 1,
