@@ -599,16 +599,12 @@ export default function HomeScreen() {
       const yesterdayStart = yesterdayDate.toISOString();
 
       // Fetch all leads data for unique counting (excluding resubmitted)
-      // We need the actual data to calculate unique customers
-      const [allLeadsResult, todayLeadsResult, yesterdayLeadsResult, leadsResult] = await Promise.all([
-        // All leads (excluding resubmitted) - fetch all for unique counting
-        supabase
-          .from("leads")
-          .select(
-            "id, customer_name, airtel_number, alternate_number, email, bypass_duplicate_check, resubmitted, created_at"
-          )
-          .neq("resubmitted", true),
-        
+      // Calculate total registered by summing all months' registrations
+      const totalFromAllMonths = await calculateTotalFromAllMonths();
+      setTotalCount(totalFromAllMonths);
+
+      // We need the actual data to calculate unique customers for today and yesterday
+      const [todayLeadsResult, yesterdayLeadsResult, leadsResult] = await Promise.all([
         // Today's leads (including resubmitted)
         supabase
           .from("leads")
@@ -637,16 +633,6 @@ export default function HomeScreen() {
           .order("created_at", { ascending: false })
           .limit(200), // Limit to 200 most recent leads for faster loading
       ]);
-
-      // Calculate unique counts
-      if (allLeadsResult.error) {
-        handleSupabaseError(allLeadsResult.error);
-        console.error("Error fetching total leads:", allLeadsResult.error);
-        setTotalCount(0);
-      } else {
-        const uniqueTotalCount = countUniqueCustomers(allLeadsResult.data || []);
-        setTotalCount(uniqueTotalCount);
-      }
 
       if (todayLeadsResult.error) {
         handleSupabaseError(todayLeadsResult.error);
@@ -719,6 +705,87 @@ export default function HomeScreen() {
     }
   };
 
+  // Calculate total registered by summing all months' registrations
+  // Uses the exact same logic as fetchMonthCount for each month
+  const calculateTotalFromAllMonths = async () => {
+    if (!isSupabaseConfigured) {
+      return 0;
+    }
+
+    try {
+      const supabase = getSupabaseClient();
+
+      // Get the earliest registration date
+      const { data: earliestLead, error: earliestError } = await supabase
+        .from("leads")
+        .select("created_at")
+        .neq("resubmitted", true)
+        .order("created_at", { ascending: true })
+        .limit(1);
+
+      if (earliestError || !earliestLead || earliestLead.length === 0) {
+        return 0;
+      }
+
+      // Parse the earliest date
+      const earliestDate = new Date(earliestLead[0].created_at);
+      const now = new Date();
+      
+      // Start from the first month with registrations
+      let currentYear = earliestDate.getFullYear();
+      let currentMonth = earliestDate.getMonth();
+      
+      // End at the current month
+      const endYear = now.getFullYear();
+      const endMonth = now.getMonth();
+
+      let totalSum = 0;
+
+      // Iterate through each month from earliest to current
+      // Use the EXACT same date range logic as fetchMonthCount
+      while (
+        currentYear < endYear || 
+        (currentYear === endYear && currentMonth <= endMonth)
+      ) {
+        // Use the exact same date calculation as fetchMonthCount
+        const firstDay = new Date(currentYear, currentMonth, 1);
+        const lastDay = new Date(currentYear, currentMonth + 1, 0, 23, 59, 59, 999);
+
+        const monthStart = firstDay.toISOString();
+        const monthEnd = lastDay.toISOString();
+
+        // Use the exact same query as fetchMonthCount
+        const { data: monthLeads, error: monthError } = await supabase
+          .from("leads")
+          .select("id, customer_name, airtel_number, alternate_number, email, bypass_duplicate_check, resubmitted, created_at")
+          .gte("created_at", monthStart)
+          .lte("created_at", monthEnd)
+          .neq("resubmitted", true);
+
+        if (monthError) {
+          console.error(`Error fetching leads for ${currentYear}-${currentMonth}:`, monthError);
+          // Continue to next month even if this one fails
+        } else if (monthLeads && monthLeads.length > 0) {
+          // Use the exact same counting logic as fetchMonthCount
+          const uniqueCount = countUniqueCustomers(monthLeads);
+          totalSum += uniqueCount;
+        }
+
+        // Move to next month
+        currentMonth++;
+        if (currentMonth > 11) {
+          currentMonth = 0;
+          currentYear++;
+        }
+      }
+
+      return totalSum;
+    } catch (error) {
+      console.error("Unexpected error in calculateTotalFromAllMonths:", error);
+      return 0;
+    }
+  };
+
   // Fetch selected month count
   const fetchMonthCount = async (year: number, month: number, showLoading = true) => {
     if (!isSupabaseConfigured) {
@@ -770,12 +837,20 @@ export default function HomeScreen() {
   // Animate progress when count changes
   useEffect(() => {
     if (currentMonthCount !== null) {
-      const progress = Math.min(currentMonthCount / TARGET_MONTHLY, 1);
+      const newProgress = Math.min(currentMonthCount / TARGET_MONTHLY, 1);
       Animated.timing(progressAnimation, {
-        toValue: progress,
+        toValue: newProgress,
         duration: 1000,
         useNativeDriver: false,
-      }).start();
+      }).start((finished) => {
+        if (finished) {
+          // Ensure value is set even if animation completes immediately
+          progressAnimation.setValue(newProgress);
+        }
+      });
+    } else {
+      // Reset to 0 when count is null
+      progressAnimation.setValue(0);
     }
   }, [currentMonthCount, progressAnimation]);
 
@@ -838,18 +913,48 @@ export default function HomeScreen() {
   const CircularProgress = ({ size = 280, strokeWidth = 20 }: { size?: number; strokeWidth?: number }) => {
     const radius = (size - strokeWidth) / 2;
     const circumference = 2 * Math.PI * radius;
-    const [animatedValue, setAnimatedValue] = useState(0);
+    const [animatedValue, setAnimatedValue] = useState(progress);
 
     useEffect(() => {
-      const listener = progressAnimation.addListener(({ value }) => {
-        setAnimatedValue(value);
-      });
+      // Set initial value from current progress
+      setAnimatedValue(progress);
+      
+      // Listen for animation updates
+      let listener: string | null = null;
+      try {
+        listener = progressAnimation.addListener(({ value }) => {
+          if (typeof value === 'number' && !isNaN(value)) {
+            setAnimatedValue(value);
+          }
+        });
+      } catch (error) {
+        // If listener fails, use progress directly
+        setAnimatedValue(progress);
+      }
+      
+      // Also set a timeout to ensure value updates even if listener doesn't fire
+      const timeout = setTimeout(() => {
+        setAnimatedValue(progress);
+      }, 100);
+      
       return () => {
-        progressAnimation.removeListener(listener);
+        clearTimeout(timeout);
+        if (listener) {
+          try {
+            progressAnimation.removeListener(listener);
+          } catch (error) {
+            // Ignore cleanup errors
+          }
+        }
       };
-    }, []);
+    }, [progress]);
 
-    const strokeDashoffset = circumference * (1 - animatedValue);
+    // Use the higher value to ensure progress is always visible when there's data
+    // But don't show if progress is 0 and we're still loading
+    const displayValue = currentMonthCount !== null 
+      ? Math.max(animatedValue, progress) 
+      : 0;
+    const strokeDashoffset = circumference * (1 - displayValue);
 
     return (
       <View style={styles.progressContainer}>
@@ -1979,7 +2084,7 @@ export default function HomeScreen() {
         </View>
 
         {/* Circular Progress */}
-        <CircularProgress size={280} strokeWidth={20} />
+        <CircularProgress size={220} strokeWidth={16} />
         
         <View style={styles.monthlyInfoContainer}>
           <Text style={styles.monthlyInfoText}>
@@ -2885,9 +2990,9 @@ const styles = StyleSheet.create({
     color: "#10B981",
   },
   graphContainer: {
-    marginTop: 30,
+    marginTop: 20,
     marginHorizontal: 20,
-    paddingVertical: 20,
+    paddingVertical: 16,
     paddingHorizontal: 16,
     backgroundColor: "#1A1A1A",
     borderRadius: 12,
@@ -2896,16 +3001,16 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   monthlyTitle: {
-    fontSize: 20,
+    fontSize: 18,
     fontFamily: "Montserrat_600SemiBold",
     color: "#FFD700",
-    marginBottom: 16,
+    marginBottom: 12,
   },
   monthSelector: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    marginBottom: 24,
+    marginBottom: 16,
     gap: 16,
   },
   monthNavButton: {
@@ -2928,7 +3033,7 @@ const styles = StyleSheet.create({
     position: "relative",
     justifyContent: "center",
     alignItems: "center",
-    marginVertical: 20,
+    marginVertical: 12,
   },
   progressSvg: {
     transform: [{ rotate: "-90deg" }],
@@ -2939,16 +3044,16 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   progressNumber: {
-    fontSize: 56,
+    fontSize: 44,
     fontFamily: "Inter_700Bold",
     color: "#FFD700",
-    lineHeight: 64,
+    lineHeight: 52,
   },
   progressTarget: {
-    fontSize: 32,
+    fontSize: 26,
     fontFamily: "Inter_400Regular",
     color: "#9CA3AF",
-    lineHeight: 40,
+    lineHeight: 32,
   },
   progressLabel: {
     fontSize: 16,
@@ -2965,7 +3070,7 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
   monthlyInfoContainer: {
-    marginTop: 20,
+    marginTop: 12,
     alignItems: "center",
   },
   monthlyInfoText: {

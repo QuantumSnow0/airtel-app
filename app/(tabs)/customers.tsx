@@ -1,5 +1,6 @@
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import LottieView from "lottie-react-native";
 import React, { useEffect, useState } from "react";
 import {
   Linking,
@@ -45,6 +46,7 @@ export default function CustomersScreen() {
   const [allCustomers, setAllCustomers] = useState<Customer[]>([]); // Store all loaded customers
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [hasLoadedOnce, setHasLoadedOnce] = useState(false); // Track if initial load has completed
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedTown, setSelectedTown] = useState<string | null>(null);
   const [availableTowns, setAvailableTowns] = useState<string[]>([]);
@@ -132,6 +134,9 @@ export default function CustomersScreen() {
     return patterns;
   };
 
+  const [searchResults, setSearchResults] = useState<Customer[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+
   // Only refetch from database when town or visit date filters change
   useEffect(() => {
     if (isSupabaseConfigured) {
@@ -139,43 +144,94 @@ export default function CustomersScreen() {
     }
   }, [selectedTown, selectedVisitDate]); // Removed searchQuery - will filter client-side
 
-  // Filter customers client-side based on search query (instant, no database query)
-  const filteredCustomers = React.useMemo(() => {
-    if (!searchQuery.trim()) {
-      return allCustomers;
-    }
-
-    const query = searchQuery.toLowerCase().trim();
-    const phonePatterns = getPhoneSearchPatterns(searchQuery);
-
-    return allCustomers.filter((customer) => {
-      // Search in customer name
-      if (customer.customer_name?.toLowerCase().includes(query)) {
-        return true;
+  // Perform server-side search when search query changes
+  useEffect(() => {
+    const searchTimeout = setTimeout(async () => {
+      if (!searchQuery.trim()) {
+        setSearchResults([]);
+        setIsSearching(false);
+        return;
       }
 
-      // Search in installation town
-      if (customer.installation_town?.toLowerCase().includes(query)) {
-        return true;
+      if (!isSupabaseConfigured) {
+        return;
       }
 
-      // Search in phone numbers
-      const airtelNumber = customer.airtel_number?.toLowerCase() || "";
-      const alternateNumber = customer.alternate_number?.toLowerCase() || "";
+      setIsSearching(true);
+      await performSearch(searchQuery);
+    }, 300); // Debounce search by 300ms
 
+    return () => clearTimeout(searchTimeout);
+  }, [searchQuery, selectedTown, selectedVisitDate]);
+
+  // Perform server-side search
+  const performSearch = async (query: string) => {
+    try {
+      const supabase = getSupabaseClient();
+      const searchTerm = query.trim().toLowerCase();
+      const phonePatterns = getPhoneSearchPatterns(query);
+
+      let searchQuery = supabase
+        .from("leads")
+        .select(
+          "id, customer_name, installation_town, airtel_number, alternate_number, email, preferred_package, delivery_landmark, visit_date, visit_time, created_at, agent_name, agent_mobile, lead_type, connection_type"
+        )
+        .neq("resubmitted", true);
+
+      // Apply town filter if set
+      if (selectedTown) {
+        searchQuery = searchQuery.eq("installation_town", selectedTown);
+      }
+
+      // Apply visit date filter if set
+      if (selectedVisitDate) {
+        searchQuery = searchQuery.eq("visit_date", selectedVisitDate);
+      }
+
+      // Build OR conditions to search across all fields
+      const orConditions: string[] = [];
+      orConditions.push(`customer_name.ilike.%${searchTerm}%`);
+      orConditions.push(`installation_town.ilike.%${searchTerm}%`);
+      
       if (phonePatterns.length > 0) {
-        // Use phone patterns if available
-        return phonePatterns.some(
-          (pattern) =>
-            airtelNumber.includes(pattern.toLowerCase()) ||
-            alternateNumber.includes(pattern.toLowerCase())
-        );
+        phonePatterns.forEach((pattern) => {
+          orConditions.push(`airtel_number.ilike.%${pattern}%`);
+          orConditions.push(`alternate_number.ilike.%${pattern}%`);
+        });
       } else {
-        // Fallback: search as-is
-        return airtelNumber.includes(query) || alternateNumber.includes(query);
+        orConditions.push(`airtel_number.ilike.%${searchTerm}%`);
+        orConditions.push(`alternate_number.ilike.%${searchTerm}%`);
       }
-    });
-  }, [allCustomers, searchQuery]);
+
+      searchQuery = searchQuery.or(orConditions.join(","))
+        .order("installation_town", { ascending: true })
+        .order("customer_name", { ascending: true })
+        .limit(1000); // Limit search results to 1000 for performance
+
+      const { data, error } = await searchQuery;
+
+      if (error) {
+        handleSupabaseError(error);
+        console.error("Error searching customers:", error);
+        setSearchResults([]);
+      } else {
+        setSearchResults(data || []);
+      }
+    } catch (error) {
+      console.error("Error performing search:", error);
+      setSearchResults([]);
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  // Use search results if searching, otherwise use all customers
+  const filteredCustomers = React.useMemo(() => {
+    if (searchQuery.trim()) {
+      return searchResults;
+    }
+    return allCustomers;
+  }, [allCustomers, searchResults, searchQuery]);
 
   // Update marked dates when dates or selection changes
   useEffect(() => {
@@ -383,7 +439,7 @@ export default function CustomersScreen() {
         .neq("resubmitted", true) // Exclude resubmitted customers
         .order("installation_town", { ascending: true })
         .order("customer_name", { ascending: true })
-        .limit(500); // Limit to 500 most recent for performance
+        .limit(2000); // Limit initial load for performance - search will use server-side query
 
       // Apply town filter
       if (selectedTown) {
@@ -407,10 +463,18 @@ export default function CustomersScreen() {
       } else {
         setAllCustomers(data || []);
       }
+      
+      // Mark that we've loaded at least once
+      setHasLoadedOnce(true);
+      
+      // Set loading to false after customers are set
+      if (showLoadingState) {
+        setLoading(false);
+      }
     } catch (error) {
       console.error("Error:", error);
-      setCustomers([]);
-    } finally {
+      setAllCustomers([]);
+      setHasLoadedOnce(true);
       if (showLoadingState) {
         setLoading(false);
       }
@@ -773,13 +837,38 @@ export default function CustomersScreen() {
             />
           }
         >
-          {loading && allCustomers.length === 0 ? (
+          {loading ? (
             <View style={styles.emptyState}>
-              <Text style={styles.emptyText}>Loading...</Text>
+              <LottieView
+                source={require("../../assets/animations/search.json")}
+                autoPlay
+                loop
+                style={styles.searchAnimation}
+              />
+            </View>
+          ) : isSearching ? (
+            <View style={styles.emptyState}>
+              <LottieView
+                source={require("../../assets/animations/searching.json")}
+                autoPlay
+                loop
+                style={styles.searchAnimation}
+              />
+            </View>
+          ) : filteredCustomers.length === 0 && hasLoadedOnce ? (
+            <View style={styles.emptyState}>
+              <Text style={styles.emptyText}>
+                {searchQuery.trim() ? "No customers found" : "No customers found"}
+              </Text>
             </View>
           ) : filteredCustomers.length === 0 ? (
             <View style={styles.emptyState}>
-              <Text style={styles.emptyText}>No customers found</Text>
+              <LottieView
+                source={require("../../assets/animations/search.json")}
+                autoPlay
+                loop
+                style={styles.searchAnimation}
+              />
             </View>
           ) : (
             filteredCustomers.map((customer) => {
@@ -1265,6 +1354,11 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontFamily: "Inter_400Regular",
     color: "#6B7280",
+    marginTop: 16,
+  },
+  searchAnimation: {
+    width: 150,
+    height: 150,
   },
   modalOverlay: {
     flex: 1,
