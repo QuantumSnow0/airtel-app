@@ -112,11 +112,20 @@ export default function HomeScreen() {
   const TARGET_MONTHLY = 1000;
   const [currentMonthCount, setCurrentMonthCount] = useState<number | null>(null);
   const [monthLoading, setMonthLoading] = useState(false);
+  // Celebration state - show if target is achieved for current month
+  const [showCelebration, setShowCelebration] = useState(false);
+  const celebrationOpacity = useRef(new Animated.Value(0)).current;
   const [selectedMonth, setSelectedMonth] = useState(() => {
     const now = new Date();
     return { year: now.getFullYear(), month: now.getMonth() };
   });
+  const selectedMonthRef = useRef(selectedMonth);
   const progressAnimation = useRef(new Animated.Value(0)).current;
+  
+  // Keep ref in sync with state
+  useEffect(() => {
+    selectedMonthRef.current = selectedMonth;
+  }, [selectedMonth]);
 
   // Fetch available towns for filter
   const fetchTowns = useCallback(async () => {
@@ -212,6 +221,7 @@ export default function HomeScreen() {
 
       // Set up Realtime subscription
       const supabase = getSupabaseClient();
+      console.log("🔌 Setting up realtime subscription for leads table...");
       const channel = supabase
         .channel("leads-changes")
         .on(
@@ -243,13 +253,42 @@ export default function HomeScreen() {
               });
             }
 
-            // Refetch counts when any change occurs (without showing loading)
-            fetchCounts(false);
+            console.log("🔄 New lead inserted, refreshing counts...", {
+              leadId: newLead.id,
+              customerName: newLead.customer_name,
+              createdAt: newLead.created_at
+            });
             
-            // Update monthly progress if viewing current month
-            const currentDate = new Date();
-            if (selectedMonth.year === currentDate.getFullYear() && selectedMonth.month === currentDate.getMonth()) {
-              fetchMonthCount(selectedMonth.year, selectedMonth.month, false);
+            try {
+              // Refetch counts when any change occurs (without showing loading)
+              // This updates totalCount via calculateTotalFromAllMonths()
+              await fetchCounts(false);
+              console.log("✅ fetchCounts completed, totalCount should be updated");
+              
+              // Always refresh the current month (today's month) when new leads are added
+              // This ensures the monthly count updates in real-time
+              const now = new Date();
+              const currentYear = now.getFullYear();
+              const currentMonth = now.getMonth();
+              
+              // Check if the new lead is from the current month
+              const leadDate = new Date(newLead.created_at);
+              if (leadDate.getFullYear() === currentYear && leadDate.getMonth() === currentMonth) {
+                console.log("📅 New lead is from current month, refreshing current month count");
+                await fetchMonthCount(currentYear, currentMonth, false);
+                console.log("✅ Current month count refreshed");
+              }
+              
+              // Also refresh the selected month if it's different from current month
+              // This ensures the UI stays in sync if user is viewing a different month
+              const currentSelectedMonth = selectedMonthRef.current;
+              if (currentSelectedMonth.year !== currentYear || currentSelectedMonth.month !== currentMonth) {
+                console.log("📅 Refreshing selected month (different from current):", currentSelectedMonth);
+                await fetchMonthCount(currentSelectedMonth.year, currentSelectedMonth.month, false);
+                console.log("✅ Selected month count refreshed");
+              }
+            } catch (error) {
+              console.error("❌ Error refreshing counts after new lead:", error);
             }
           }
         )
@@ -260,17 +299,25 @@ export default function HomeScreen() {
             schema: "public",
             table: "leads",
           },
-          () => {
+          async (payload) => {
+            console.log("🔄 Lead updated, refreshing counts...");
+            
             // Refetch counts when any update occurs
-            fetchCounts(false);
-            // Update monthly progress if viewing current month
-            const currentDate = new Date();
-            if (selectedMonth.year === currentDate.getFullYear() && selectedMonth.month === currentDate.getMonth()) {
-              fetchMonthCount(selectedMonth.year, selectedMonth.month, false);
-            }
+            // This updates totalCount via calculateTotalFromAllMonths()
+            await fetchCounts(false);
+            console.log("✅ fetchCounts completed");
+            
+            // Always refresh the currently selected month when leads are updated
+            // This ensures the monthly count updates in real-time
+            const currentSelectedMonth = selectedMonthRef.current;
+            console.log("📅 Refreshing selected month:", currentSelectedMonth);
+            await fetchMonthCount(currentSelectedMonth.year, currentSelectedMonth.month, false);
+            console.log("✅ fetchMonthCount completed");
           }
         )
-        .subscribe();
+        .subscribe((status) => {
+          console.log("📡 Realtime subscription status:", status);
+        });
 
       // Cleanup subscription on unmount
       return () => {
@@ -600,8 +647,15 @@ export default function HomeScreen() {
 
       // Fetch all leads data for unique counting (excluding resubmitted)
       // Calculate total registered by summing all months' registrations
+      console.log("🔄 Starting calculateTotalFromAllMonths...");
       const totalFromAllMonths = await calculateTotalFromAllMonths();
-      setTotalCount(totalFromAllMonths);
+      console.log("📊 Total from all months calculated:", totalFromAllMonths);
+      if (totalFromAllMonths !== null && totalFromAllMonths !== undefined) {
+        setTotalCount(totalFromAllMonths);
+        console.log("✅ totalCount state updated to:", totalFromAllMonths);
+      } else {
+        console.error("❌ calculateTotalFromAllMonths returned null/undefined");
+      }
 
       // We need the actual data to calculate unique customers for today and yesterday
       const [todayLeadsResult, yesterdayLeadsResult, leadsResult] = await Promise.all([
@@ -687,8 +741,10 @@ export default function HomeScreen() {
         setLeads(leadsResult.data || []);
       }
 
-      // Fetch monthly progress data
-      await fetchMonthCount(selectedMonth.year, selectedMonth.month, false);
+      // Fetch monthly progress data - use ref to get latest selected month
+      const currentSelectedMonth = selectedMonthRef.current;
+      await fetchMonthCount(currentSelectedMonth.year, currentSelectedMonth.month, false);
+      console.log("✅ fetchMonthCount completed in fetchCounts");
     } catch (error) {
       console.error("Unexpected error in fetchCounts:", {
         error,
@@ -740,6 +796,9 @@ export default function HomeScreen() {
       const endMonth = now.getMonth();
 
       let totalSum = 0;
+      let monthCount = 0;
+
+      console.log(`🔄 Calculating total from ${currentYear}-${currentMonth} to ${endYear}-${endMonth}`);
 
       // Iterate through each month from earliest to current
       // Use the EXACT same date range logic as fetchMonthCount
@@ -747,6 +806,7 @@ export default function HomeScreen() {
         currentYear < endYear || 
         (currentYear === endYear && currentMonth <= endMonth)
       ) {
+        monthCount++;
         // Use the exact same date calculation as fetchMonthCount
         const firstDay = new Date(currentYear, currentMonth, 1);
         const lastDay = new Date(currentYear, currentMonth + 1, 0, 23, 59, 59, 999);
@@ -763,12 +823,13 @@ export default function HomeScreen() {
           .neq("resubmitted", true);
 
         if (monthError) {
-          console.error(`Error fetching leads for ${currentYear}-${currentMonth}:`, monthError);
+          console.error(`❌ Error fetching leads for ${currentYear}-${currentMonth}:`, monthError);
           // Continue to next month even if this one fails
         } else if (monthLeads && monthLeads.length > 0) {
           // Use the exact same counting logic as fetchMonthCount
           const uniqueCount = countUniqueCustomers(monthLeads);
           totalSum += uniqueCount;
+          console.log(`  ✓ ${currentYear}-${currentMonth}: ${uniqueCount} unique (${monthLeads.length} total leads)`);
         }
 
         // Move to next month
@@ -779,6 +840,7 @@ export default function HomeScreen() {
         }
       }
 
+      console.log(`✅ Calculated total from ${monthCount} months: ${totalSum}`);
       return totalSum;
     } catch (error) {
       console.error("Unexpected error in calculateTotalFromAllMonths:", error);
@@ -807,13 +869,57 @@ export default function HomeScreen() {
       const monthStart = firstDay.toISOString();
       const monthEnd = lastDay.toISOString();
 
+      console.log(`🔍 fetchMonthCount for ${year}-${month}:`, {
+        monthStart,
+        monthEnd,
+        firstDay: firstDay.toISOString(),
+        lastDay: lastDay.toISOString()
+      });
+
       // Fetch all leads for selected month (excluding resubmitted)
-      const { data: leads, error } = await supabase
-        .from("leads")
-        .select("id, customer_name, airtel_number, alternate_number, email, bypass_duplicate_check, resubmitted, created_at")
-        .gte("created_at", monthStart)
-        .lte("created_at", monthEnd)
-        .neq("resubmitted", true);
+      // Note: Supabase has a default limit of 1000, so we need to fetch in batches if there are more
+      let allLeads: Lead[] = [];
+      let from = 0;
+      const batchSize = 1000;
+      let hasMore = true;
+
+      while (hasMore) {
+        const { data: leads, error: batchError } = await supabase
+          .from("leads")
+          .select("id, customer_name, airtel_number, alternate_number, email, bypass_duplicate_check, resubmitted, created_at")
+          .gte("created_at", monthStart)
+          .lte("created_at", monthEnd)
+          .neq("resubmitted", true)
+          .range(from, from + batchSize - 1)
+          .order("created_at", { ascending: true });
+
+        if (batchError) {
+          console.error(`Error fetching leads batch (${from} to ${from + batchSize - 1}):`, batchError);
+          break;
+        }
+
+        if (leads && leads.length > 0) {
+          allLeads = [...allLeads, ...leads];
+          from += batchSize;
+          hasMore = leads.length === batchSize; // If we got a full batch, there might be more
+        } else {
+          hasMore = false;
+        }
+      }
+
+      const leads = allLeads;
+      const error = null; // No error if we got here
+
+      if (error) {
+        console.log(`📥 Fetched ${leads?.length || 0} leads for ${year}-${month}`, {
+          hasError: true,
+          error: String(error)
+        });
+      } else {
+        console.log(`📥 Fetched ${leads?.length || 0} leads for ${year}-${month}`, {
+          hasError: false
+        });
+      }
 
       if (error) {
         handleSupabaseError(error);
@@ -821,8 +927,51 @@ export default function HomeScreen() {
         setCurrentMonthCount(0);
       } else {
         // Use the comprehensive duplicate detection logic
-        const uniqueCount = countUniqueCustomers(leads || []);
+        const rawLeads = leads || [];
+        console.log(`📊 Processing ${rawLeads.length} raw leads for ${year}-${month}`);
+        
+        // Check if this is the current month
+        const now = new Date();
+        const isCurrentMonthCheck = year === now.getFullYear() && month === now.getMonth();
+        console.log(`📅 Is current month? ${isCurrentMonthCheck} (now: ${now.getFullYear()}-${now.getMonth()}, selected: ${year}-${month})`);
+        
+        // Show sample of lead dates to verify date range
+        if (rawLeads.length > 0) {
+          const sampleDates = rawLeads.slice(0, 3).map(l => new Date(l.created_at).toISOString());
+          console.log(`📆 Sample lead dates:`, sampleDates);
+        }
+        
+        const uniqueCount = countUniqueCustomers(rawLeads);
+        console.log(`📈 Month count for ${year}-${month}:`, uniqueCount, "unique from", rawLeads.length, "total leads");
+        console.log(`💾 Setting currentMonthCount state to:`, uniqueCount);
+        
+        // Check if we just hit or exceeded the target
+        const previousCount = currentMonthCount;
+        
         setCurrentMonthCount(uniqueCount);
+        
+        // Show celebration if target is achieved for the current month
+        // It will stay visible until the month ends
+        if (isCurrentMonthCheck && uniqueCount >= TARGET_MONTHLY) {
+          if (!showCelebration) {
+            console.log("🎉 Target reached! Showing celebration...");
+            setShowCelebration(true);
+            // Animate celebration appearance
+            Animated.timing(celebrationOpacity, {
+              toValue: 1,
+              duration: 500,
+              useNativeDriver: true,
+            }).start();
+          }
+        } else {
+          // Hide celebration if we're not in current month or target not reached
+          if (showCelebration) {
+            setShowCelebration(false);
+            celebrationOpacity.setValue(0);
+          }
+        }
+        
+        console.log("✅ currentMonthCount state updated to:", uniqueCount);
       }
     } catch (error) {
       console.error("Unexpected error in fetchMonthCount:", error);
@@ -857,7 +1006,22 @@ export default function HomeScreen() {
   // Fetch data when selected month changes
   useEffect(() => {
     fetchMonthCount(selectedMonth.year, selectedMonth.month);
-  }, [selectedMonth]);
+    
+    // Update celebration visibility based on selected month
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth();
+    const isCurrentMonth = selectedMonth.year === currentYear && selectedMonth.month === currentMonth;
+    
+    // Only show celebration if viewing current month and target is achieved
+    if (isCurrentMonth && currentMonthCount !== null && currentMonthCount >= TARGET_MONTHLY) {
+      setShowCelebration(true);
+      celebrationOpacity.setValue(1);
+    } else {
+      setShowCelebration(false);
+      celebrationOpacity.setValue(0);
+    }
+  }, [selectedMonth, currentMonthCount]);
 
   // Get month name
   const getMonthName = (year: number, month: number) => {
@@ -956,8 +1120,25 @@ export default function HomeScreen() {
       : 0;
     const strokeDashoffset = circumference * (1 - displayValue);
 
+    // Check if target is achieved - also show when celebration is manually triggered (for testing)
+    const targetAchieved = (currentMonthCount !== null && currentMonthCount >= TARGET_MONTHLY && isCurrentMonth()) || showCelebration;
+    const progressColor = targetAchieved ? "#10B981" : "#FFD700"; // Green when achieved, gold otherwise
+    
     return (
       <View style={styles.progressContainer}>
+        {/* Flower decorations when target is achieved or celebration is shown */}
+        {showCelebration && (
+          <View style={styles.flowerDecorations}>
+            <Text style={[styles.flower, styles.flowerTopLeft]}>🌸</Text>
+            <Text style={[styles.flower, styles.flowerTopRight]}>🌺</Text>
+            <Text style={[styles.flower, styles.flowerBottomLeft]}>🌻</Text>
+            <Text style={[styles.flower, styles.flowerBottomRight]}>🌷</Text>
+            <Text style={[styles.flower, styles.flowerTop]}>🌼</Text>
+            <Text style={[styles.flower, styles.flowerBottom]}>🌹</Text>
+            <Text style={[styles.flower, styles.flowerLeft]}>🌿</Text>
+            <Text style={[styles.flower, styles.flowerRight]}>🌿</Text>
+          </View>
+        )}
         <Svg width={size} height={size} style={styles.progressSvg}>
           {/* Background circle */}
           <Circle
@@ -968,12 +1149,12 @@ export default function HomeScreen() {
             strokeWidth={strokeWidth}
             fill="transparent"
           />
-          {/* Progress circle */}
+          {/* Progress circle - green when target achieved */}
           <Circle
             cx={size / 2}
             cy={size / 2}
             r={radius}
-            stroke="#FFD700"
+            stroke={progressColor}
             strokeWidth={strokeWidth}
             fill="transparent"
             strokeDasharray={circumference}
@@ -2097,6 +2278,7 @@ export default function HomeScreen() {
                 : "Target achieved! 🎉"}
             </Text>
           )}
+          
         </View>
       </View>
 
@@ -3038,6 +3220,55 @@ const styles = StyleSheet.create({
   progressSvg: {
     transform: [{ rotate: "-90deg" }],
   },
+  progressWrapper: {
+    position: "relative",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  flowerDecorations: {
+    position: "absolute",
+    width: 280,
+    height: 280,
+    justifyContent: "center",
+    alignItems: "center",
+    zIndex: 1,
+  },
+  flower: {
+    position: "absolute",
+    fontSize: 28,
+  },
+  flowerTopLeft: {
+    top: 10,
+    left: 10,
+  },
+  flowerTopRight: {
+    top: 10,
+    right: 10,
+  },
+  flowerBottomLeft: {
+    bottom: 10,
+    left: 10,
+  },
+  flowerBottomRight: {
+    bottom: 10,
+    right: 10,
+  },
+  flowerTop: {
+    top: 0,
+    alignSelf: "center",
+  },
+  flowerBottom: {
+    bottom: 0,
+    alignSelf: "center",
+  },
+  flowerLeft: {
+    left: 0,
+    alignSelf: "center",
+  },
+  flowerRight: {
+    right: 0,
+    alignSelf: "center",
+  },
   progressContent: {
     position: "absolute",
     justifyContent: "center",
@@ -3233,6 +3464,67 @@ const styles = StyleSheet.create({
     color: "#888888",
     textAlign: "center",
   },
+  celebrationOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0, 0, 0, 0.8)",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  celebrationContainer: {
+    width: "85%",
+    maxWidth: 400,
+    alignItems: "center",
+  },
+  celebrationContent: {
+    backgroundColor: "#1A1A1A",
+    borderRadius: 24,
+    padding: 32,
+    alignItems: "center",
+    borderWidth: 2,
+    borderColor: "#FFD700",
+    shadowColor: "#FFD700",
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.5,
+    shadowRadius: 20,
+    elevation: 10,
+  },
+  celebrationEmoji: {
+    fontSize: 80,
+    marginBottom: 16,
+  },
+  celebrationTitle: {
+    fontSize: 28,
+    fontWeight: "bold",
+    color: "#FFD700",
+    marginBottom: 12,
+    textAlign: "center",
+  },
+  celebrationSubtitle: {
+    fontSize: 16,
+    color: "#E5E5E5",
+    textAlign: "center",
+    marginBottom: 20,
+    lineHeight: 22,
+  },
+  celebrationCount: {
+    fontSize: 32,
+    fontWeight: "bold",
+    color: "#FFD700",
+    marginBottom: 24,
+  },
+  celebrationButton: {
+    backgroundColor: "#FFD700",
+    paddingHorizontal: 32,
+    paddingVertical: 14,
+    borderRadius: 12,
+    minWidth: 150,
+  },
+  celebrationButtonText: {
+    color: "#0A0A0A",
+    fontSize: 18,
+    fontWeight: "bold",
+    textAlign: "center",
+  },
   dateRangeButtonTextActive: {
     color: "#000000",
     fontFamily: "Inter_700Bold",
@@ -3312,5 +3604,57 @@ const styles = StyleSheet.create({
   xAxisLabelToday: {
     color: "#10B981",
     fontFamily: "Inter_600SemiBold",
+  },
+  celebrationBanner: {
+    marginTop: 16,
+    width: "100%",
+    borderRadius: 12,
+    overflow: "hidden",
+  },
+  celebrationBannerContent: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#1A1A1A",
+    padding: 16,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: "#FFD700",
+    shadowColor: "#FFD700",
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.3,
+    shadowRadius: 10,
+    elevation: 5,
+  },
+  celebrationBannerEmoji: {
+    fontSize: 40,
+    marginRight: 12,
+  },
+  celebrationBannerTextContainer: {
+    flex: 1,
+  },
+  celebrationBannerTitle: {
+    fontSize: 18,
+    fontWeight: "bold",
+    color: "#FFD700",
+    marginBottom: 4,
+  },
+  celebrationBannerSubtitle: {
+    fontSize: 14,
+    color: "#E5E5E5",
+  },
+  testCelebrationButton: {
+    marginTop: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    backgroundColor: "#2A2A2A",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#FFD700",
+  },
+  testCelebrationButtonText: {
+    color: "#FFD700",
+    fontSize: 12,
+    fontWeight: "600",
+    textAlign: "center",
   },
 });

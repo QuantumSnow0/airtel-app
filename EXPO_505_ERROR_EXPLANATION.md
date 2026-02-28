@@ -53,3 +53,4 @@ The Supabase 500 errors are the real issue. Check:
 
 
 
+
